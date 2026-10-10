@@ -1,0 +1,4 @@
+5 of the assembly tests used on Gradescope are included here.
+The remaining tests will be released in a later project phase.
+You are encouraged to make your own tests.
+See the documentation for how to use the Makefile.
