@@ -131,7 +131,212 @@ module hart #(
     ,`RVFI_OUTPUTS,
 `endif
 );
-    // Fill in your implementation here.
+    // From class, the loop is fetch -> decode -> execute -> write back  
+    // Instruction Decoder, takes in i_inst (from instruction memory):
+    // i_imem_rdata contains instruction word
+    wire [6:0] funct7 = i_imem_rdata[31:25];
+    wire [4:0] rs2 = i_imem_rdata[24:20];
+    wire [4:0] rs1 = i_imem_rdata[19:15];
+    wire [2:0] funct3 = i_imem_rdata[14:12];
+    wire [4:0] rd = i_imem_rdata[11:7];
+    wire [6:0] opcode = i_imem_rdata[6:0];
+
+
+    // Data register outputs
+    reg i_reg_write; // Write to register
+    reg select_a; // For ALU Mux
+    reg select_b; // For ALU Mux
+    reg [2:0] i_opsel; // For ALU
+    reg i_mem_read; // For data memory read
+    reg i_mem_write; // For data memory write
+    reg [1:0] select_c; // Memory to register mux
+    reg i_branch;
+    reg i_jal;
+    reg i_jalr;
+    reg i_halt;
+
+    // TODO: Tell Evan to include these in instruction decoder
+    reg i_sub;
+    reg i_unsigned;
+    reg i_arith;
+    reg [5:0] i_format;
+    reg [3:0] i_mem_mask;
+    reg i_trap; 
+
+    // Use the opcode to determine instruction type
+    always @(*) begin
+            // Default values to avoid latches
+            i_reg_write = 1'b0;
+            select_a    = 1'b0;
+            select_b    = 1'b0;
+            i_opsel     = 3'b000;
+            i_sub       = 1'b0;
+            i_unsigned  = 1'b0;
+            i_arith     = 1'b0;
+            i_mem_read  = 1'b0;
+            i_mem_write = 1'b0;
+            select_c    = 2'b00;
+            i_branch    = 1'b0;
+            i_jal       = 1'b0;
+            i_jalr      = 1'b0;
+            i_halt      = 1'b0;
+            i_format    = 6'b000000;
+            i_mem_mask  = 4'b0000;
+            i_trap      = 1'b0;
+            
+        case(opcode)
+
+            7'b0110011: begin // r
+                i_reg_write = 1'b1; // Write to register from ALU output
+                select_a = 1'b0; // rs1
+                select_b = 1'b0; // rs2
+                i_opsel = funct3; // ALU operation
+                i_sub = funct7[5]; // Determine if add/sub
+                i_unsigned = (funct3 == 3'b011); // For SLT / SLTU
+                i_arith = funct7[5]; // Determine if arithmetic shift
+                select_c = 2'b00; // Use ALU output and write to reg
+                i_format = 6'b000001; // R type, for imm.v (one hot)
+            end
+
+            7'b0010011: begin // i, register arithmetic
+                // Same as r type, but select_b uses immediate and no subtraction
+                i_reg_write = 1'b1;
+                select_a = 1'b0; // rs1
+                select_b = 1'b1; // immediate
+                i_opsel = funct3; 
+                i_sub = 1'b0; // No subtraction for i type
+                i_unsigned = (funct3 == 3'b011); // For SLTI / SLTIU
+                i_arith = funct7[5];
+                select_c = 2'b00;
+                i_format = 6'b000010; // I type
+            end
+            7'b0000011: begin // i, load
+            end
+            7'b1100111: begin // i, jalr
+            end
+
+
+            7'b0100011: begin // s
+            end
+
+
+            7'b1100011: begin // b
+            end
+
+
+            7'b0110111: begin // u, lui - Load upper immediate into rd
+                i_reg_write = 1'b1;
+                select_c = 2'b11; // Use immediate directly
+                i_format = 6'b010000; // U type
+            end
+            7'b0010111: begin // u, auipc - Add upper immediate to PC, write to rd
+                i_reg_write = 1'b1;
+                select_a = 1'b1; // PC
+                select_b = 1'b1; // Immediate
+                select_c = 2'b00;
+                i_format = 6'b010000; // U type
+            end
+
+
+            7'b1101111: begin // j
+            end
+            default: begin
+                i_trap = 1'b1; // Illegal instruction
+            end
+        endcase
+
+    end
+
+    // PC
+    reg [31:0] pc;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            pc <= RESET_ADDR;
+        end else begin
+            pc <= pc + 4; // TODO: Add more logic later for jumps and branches
+        end
+        // TODO: Add more logic for updating        
+    end
+        // TODO:
+        assign o_imem_raddr = pc;
+        assign o_retire_pc = pc;
+
+
+    // Register File
+    wire [31:0] rs1_rdata;
+    wire [31:0] rs2_rdata;
+    wire [31:0] rd_wdata; // TODO: drive this from your write-back mux (select_c)
+
+    rf #(
+        .BYPASS_EN(0)
+    ) u_rf (
+        .i_clk      (i_clk),
+        .i_rst      (i_rst),
+        .i_rs1_raddr(rs1),
+        .o_rs1_rdata(rs1_rdata),
+        .i_rs2_raddr(rs2),
+        .o_rs2_rdata(rs2_rdata),
+        .i_rd_wen   (i_reg_write),
+        .i_rd_waddr (rd),
+        .i_rd_wdata (rd_wdata)
+    );
+
+    // Immediate
+    wire [31:0] immediate;
+
+    imm u_imm (
+        .i_inst      (i_imem_rdata),
+        .i_format    (i_format),
+        .o_immediate (immediate)
+    );
+
+    // ALU 
+    wire [31:0] alu_op1;
+    wire [31:0] alu_op2;
+    wire [31:0] alu_result;
+    wire        alu_eq;
+    wire        alu_slt;
+
+    alu u_alu (
+        .i_opsel    (i_opsel),
+        .i_sub      (i_sub),
+        .i_unsigned (i_unsigned),
+        .i_arith    (i_arith),
+        .i_op1      (alu_op1),
+        .i_op2      (alu_op2),
+        .o_result   (alu_result),
+        .o_eq       (alu_eq),
+        .o_slt      (alu_slt)
+    );
+
+    // Muxes (Select A / B are ALU, Select C is RF)
+    assign alu_op1 = select_a ? pc : rs1_rdata;
+    assign alu_op2 = select_b ? immediate : rs2_rdata;
+    // TODO: Update the pc + 4 later on
+    assign rd_wdata = (select_c == 2'b00) ? alu_result : (select_c == 2'b01) ? i_dmem_rdata : (select_c == 2'b10) ? pc + 4 : immediate;
+
+
+    // Retire signals (For TB)
+    assign o_retire_valid = 1'b1; // Always a 1 since we are a single cycle processor
+    assign o_retire_inst = i_imem_rdata;
+    assign o_retire_trap = i_trap;
+    assign o_retire_halt = i_halt;
+    
+    assign o_retire_rs1_raddr = rs1; // Don't care if doesn't use rs1
+    assign o_retire_rs2_raddr = rs2; // Don't care if doesn't use rs2
+    assign o_retire_rs1_rdata = rs1_rdata; // Don't worry about rs1 being 0 because RF module guarantees 0
+    assign o_retire_rs2_rdata = rs2_rdata;
+    // Should be 5'd0 if we don't write to register for waddr, (wdata is don't care)
+    assign o_retire_rd_waddr = i_reg_write ? rd : 5'd0;
+    assign o_retire_rd_wdata = rd_wdata;
+
+    assign o_retire_next_pc = pc + 4; // TODO: Update this later for branches and jumps
+
+
+    // Data Memory Signals
+    
+
+
 endmodule
 
 `default_nettype wire
