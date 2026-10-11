@@ -259,7 +259,7 @@ module hart #(
         if (i_rst) begin
             pc <= RESET_ADDR;
         end else begin
-            pc <= pc + 4; // TODO: Add more logic later for jumps and branches
+            pc <= pc_next; // TODO: Add more logic later for jumps
         end
         // TODO: Add more logic for updating        
     end
@@ -336,7 +336,7 @@ module hart #(
     assign o_retire_rd_waddr = i_reg_write ? rd : 5'd0;
     assign o_retire_rd_wdata = rd_wdata;
 
-    assign o_retire_next_pc = pc + 4; // TODO: Update this later for branches and jumps
+    assign o_retire_next_pc = pc_next; // TODO: Update this later for jumps
 
 
     // Data Memory Signals (Will be updated later for load/store)
@@ -348,6 +348,18 @@ module hart #(
 
 
     // Branch logic, using outputs from ALU (Equal and SLT).
+    // Determines if PC should be updated to a branch or not based on operation and ALU flags
+    wire branch_taken = i_branch && (
+        (funct3 == 3'b000) ? alu_eq : 
+        (funct3 == 3'b001) ? !alu_eq :
+        (funct3 == 3'b100) ? alu_slt :
+        (funct3 == 3'b101) ? !alu_slt :
+        (funct3 == 3'b110) ? alu_slt :
+        (funct3 == 3'b111) ? !alu_slt : 1'b0);
+
+    wire [31:0] branch_target = pc + immediate;
+    // If branch taken, update PC accordingy
+    wire [31:0] pc_next = (branch_taken) ? branch_target : pc + 4;
 
 endmodule
 
