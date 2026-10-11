@@ -246,6 +246,9 @@ module hart #(
 
             7'b1101111: begin // j
             end
+            7'b1110011: begin // ebreak, for testing
+                i_halt = (i_imem_rdata[31:20] == 12'b000000000001); // ebreak instruction
+            end
             default: begin
                 i_trap = 1'b1; // Illegal instruction
             end
