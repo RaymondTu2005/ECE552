@@ -220,7 +220,13 @@ module hart #(
             end
 
 
-            7'b1100011: begin // b
+            7'b1100011: begin // b 
+                i_branch = 1'b1;
+                select_a = 1'b0; // rs1
+                select_b = 1'b0; // rs2
+                i_unsigned = funct3[1]; // Unsigned, BLTU/BGEU
+                i_format = 6'b001000; // B
+                // no i_opsel because branch instructions only use ALU flags, not the ALU output
             end
 
 
@@ -333,9 +339,15 @@ module hart #(
     assign o_retire_next_pc = pc + 4; // TODO: Update this later for branches and jumps
 
 
-    // Data Memory Signals
-    
+    // Data Memory Signals (Will be updated later for load/store)
+    assign o_dmem_addr = alu_result; // Address is the result of the ALU
+    assign o_dmem_wdata = rs2_rdata;
+    assign o_dmem_ren = i_mem_read;
+    assign o_dmem_wen = i_mem_write;
+    assign o_dmem_mask = i_mem_mask;
 
+
+    // Branch logic, using outputs from ALU (Equal and SLT).
 
 endmodule
 
