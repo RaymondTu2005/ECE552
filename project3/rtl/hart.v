@@ -162,6 +162,24 @@ module hart #(
     reg [5:0] i_format;
     reg i_trap; 
 
+    // ALU variables
+    wire [31:0] alu_op1;
+    wire [31:0] alu_op2;
+    wire [31:0] alu_result;
+    wire        alu_eq;
+    wire        alu_slt;
+
+    // Branch
+    wire branch_taken;
+
+    // PC
+    wire [31:0] pc_next;
+
+    // Data 
+    reg [31:0] data;
+    reg [31:0] write_data;
+
+
     // Use the opcode to determine instruction type
     always @(*) begin
             // Default values to avoid latches
@@ -319,11 +337,6 @@ module hart #(
     );
 
     // ALU 
-    wire [31:0] alu_op1;
-    wire [31:0] alu_op2;
-    wire [31:0] alu_result;
-    wire        alu_eq;
-    wire        alu_slt;
 
     alu u_alu (
         .i_opsel    (i_opsel),
@@ -369,7 +382,7 @@ module hart #(
 
     // Branch logic, using outputs from ALU (Equal and SLT).
     // Determines if PC should be updated to a branch or not based on operation and ALU flags
-    wire branch_taken = i_branch && (
+    assign branch_taken = i_branch && (
         (funct3 == 3'b000) ? alu_eq : 
         (funct3 == 3'b001) ? !alu_eq :
         (funct3 == 3'b100) ? alu_slt :
@@ -381,7 +394,7 @@ module hart #(
     wire [31:0] jalr_target = (rs1_rdata + immediate) & 32'hfffffffe; // Clear LSB to make it half-word aligned
   
     // If branch taken, update PC accordingy, or check for jump (jal / jalr)
-    wire [31:0] pc_next = (branch_taken || i_jal) ? (pc + immediate) : (i_jalr) ? jalr_target : pc + 4;
+    assign pc_next = (branch_taken || i_jal) ? (pc + immediate) : (i_jalr) ? jalr_target : pc + 4;
 
 
     // Masking logic to word align o_dmem_addr
@@ -393,16 +406,17 @@ module hart #(
     case(funct3[1:0])
         2'b00: begin // Byte
             case(alu_result[1:0])
-                2'b00: memory_mask = 4'b0001; // Byte 0
-                2'b01: memory_mask = 4'b0010; // Byte 1
-                2'b10: memory_mask = 4'b0100; // Byte 2
-                2'b11: memory_mask = 4'b1000; // Byte 3
+                2'b00: memory_mask = 4'b0001; 
+                2'b01: memory_mask = 4'b0010; 
+                2'b10: memory_mask = 4'b0100; 
+                2'b11: memory_mask = 4'b1000; 
+                default: memory_mask = 4'b0000; // For gradescope compiler
             endcase
         end
         2'b01: begin // Half word
             case(alu_result[1:0])
-                2'b00: memory_mask = 4'b0011; // Half word 0
-                2'b10: memory_mask = 4'b1100; // Half word 1
+                2'b00: memory_mask = 4'b0011;
+                2'b10: memory_mask = 4'b1100; 
                 default: memory_mask = 4'b0000; // Avoid latch, also shouldn't happen
             endcase
         end
@@ -425,19 +439,22 @@ module hart #(
     // we use it to make sure it is valid (check funct funct3[1:0] for byte / half word, should work)
     reg [7:0] byte_data;
     always @(*) begin
+        byte_data = 8'h00; // Default to avoid latches
         case(alu_result[1:0])
-            2'b00: byte_data = i_dmem_rdata[7:0]; // Byte 0
-            2'b01: byte_data = i_dmem_rdata[15:8]; // Byte 1
-            2'b10: byte_data = i_dmem_rdata[23:16]; // Byte 2
-            2'b11: byte_data = i_dmem_rdata[31:24]; // Byte 3
+            2'b00: byte_data = i_dmem_rdata[7:0]; 
+            2'b01: byte_data = i_dmem_rdata[15:8]; 
+            2'b10: byte_data = i_dmem_rdata[23:16]; 
+            2'b11: byte_data = i_dmem_rdata[31:24]; 
+            default: byte_data = 8'h00; // For gradescope compiler
         endcase
     end
 
     reg [15:0] half_word_data;
     always @(*) begin
+        half_word_data = 16'h0000; // Default to avoid latches
         case(alu_result[1:0])
-            2'b00: half_word_data = i_dmem_rdata[15:0]; // Half word 0
-            2'b10: half_word_data = i_dmem_rdata[31:16]; // Half word 1
+            2'b00: half_word_data = i_dmem_rdata[15:0]; 
+            2'b10: half_word_data = i_dmem_rdata[31:16]; 
             default: half_word_data = 16'h0000; // Shouldn't happen, but avoid latch
     endcase
     end
@@ -447,21 +464,22 @@ module hart #(
     (funct3[1:0] == 2'b01) ? half_word_data[15] : // Half word, so copy the sign bit
     1'b0 : 1'b0; // Unsigned, zero extend it
 
-    reg [31:0] data;
     always @(*) begin
+        data = 32'h0; // Default to avoid latches
         case(funct3[1:0])
-            2'b00: begin // Byte 
+            2'b00: begin // Byte
                 case(alu_result[1:0])
-                    2'b00: data = {{24{sign_bit}}, byte_data}; // Byte 0
-                    2'b01: data = {{24{sign_bit}}, byte_data}; // Byte 1
-                    2'b10: data = {{24{sign_bit}}, byte_data}; // Byte 2
-                    2'b11: data = {{24{sign_bit}}, byte_data}; // Byte 3
+                    2'b00: data = {{24{sign_bit}}, byte_data};
+                    2'b01: data = {{24{sign_bit}}, byte_data}; 
+                    2'b10: data = {{24{sign_bit}}, byte_data}; 
+                    2'b11: data = {{24{sign_bit}}, byte_data}; 
+                    default: data = 32'h0; // For gradescope compiler
                 endcase
             end
             2'b01: begin // Half word
                 case(alu_result[1:0])
-                    2'b00: data = {{16{sign_bit}}, half_word_data}; // Half word 0
-                    2'b10: data = {{16{sign_bit}}, half_word_data}; // Half word 1
+                    2'b00: data = {{16{sign_bit}}, half_word_data}; 
+                    2'b10: data = {{16{sign_bit}}, half_word_data}; 
                     default: data = 32'h0; // Shouldn't happen
                 endcase
             end
@@ -475,8 +493,8 @@ module hart #(
     end
 
     // Basically same  of load for store instructions. Use funct3 to determine byte / half word, and alu result to determine what to store
-    reg [31:0] write_data;
     always @(*) begin
+        write_data = 32'h0; // Default to avoid latches
         case(funct3[1:0])
             2'b00: begin // Byte
                 case(alu_result[1:0])
@@ -484,6 +502,7 @@ module hart #(
                     2'b01: write_data = {16'b0, rs2_rdata[7:0], 8'b0}; 
                     2'b10: write_data = {8'b0, rs2_rdata[7:0], 16'b0}; 
                     2'b11: write_data = {rs2_rdata[7:0], 24'b0}; 
+                    default: write_data = 32'h0; // For gradescope compiler
                 endcase
             end
             2'b01: begin // Half word
