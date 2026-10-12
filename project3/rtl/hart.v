@@ -498,16 +498,16 @@ module hart #(
         case(funct3[1:0])
             2'b00: begin // Byte
                 case(alu_result[1:0])
-                    2'b00: write_data = {24'b0, rs2_rdata[7:0]};
-                    2'b01: write_data = {16'b0, rs2_rdata[7:0], 8'b0}; 
-                    2'b10: write_data = {8'b0, rs2_rdata[7:0], 16'b0}; 
+                    2'b00: write_data = rs2_rdata; // Don't fill in upper bits, just keep it as is (failed gradescope before)
+                    2'b01: write_data = {rs2_rdata[23:0], 8'b0}; 
+                    2'b10: write_data = {rs2_rdata[15:0], 16'b0}; 
                     2'b11: write_data = {rs2_rdata[7:0], 24'b0}; 
                     default: write_data = 32'h0; // For gradescope compiler
                 endcase
             end
             2'b01: begin // Half word
                 case(alu_result[1:0])
-                    2'b00: write_data = {16'b0, rs2_rdata[15:0]}; 
+                    2'b00: write_data = rs2_rdata;
                     2'b10: write_data = {rs2_rdata[15:0], 16'b0}; 
                     default: write_data = 32'h0; 
                 endcase
