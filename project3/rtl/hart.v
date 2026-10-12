@@ -282,11 +282,10 @@ module hart #(
         if (i_rst) begin
             pc <= RESET_ADDR;
         end else begin
-            pc <= pc_next; // TODO: Add more logic later for jumps
+            pc <= pc_next; 
         end
-        // TODO: Add more logic for updating        
+   
     end
-        // TODO:
         assign o_imem_raddr = pc;
         assign o_retire_pc = pc;
 
@@ -294,7 +293,7 @@ module hart #(
     // Register File
     wire [31:0] rs1_rdata;
     wire [31:0] rs2_rdata;
-    wire [31:0] rd_wdata; // TODO: drive this from your write-back mux (select_c)
+    wire [31:0] rd_wdata;
 
     rf #(
         .BYPASS_EN(0)
@@ -341,8 +340,7 @@ module hart #(
     // Muxes (Select A / B are ALU, Select C is RF)
     assign alu_op1 = select_a ? pc : rs1_rdata;
     assign alu_op2 = select_b ? immediate : rs2_rdata;
-    // TODO: Update the pc + 4 later on
-    assign rd_wdata = (select_c == 2'b00) ? alu_result : (select_c == 2'b01) ? i_dmem_rdata : (select_c == 2'b10) ? pc + 4 : immediate;
+    assign rd_wdata = (select_c == 2'b00) ? alu_result : (select_c == 2'b01) ? data : (select_c == 2'b10) ? pc + 4 : immediate;
 
 
     // Retire signals (For TB)
@@ -358,13 +356,12 @@ module hart #(
     // Should be 5'd0 if we don't write to register for waddr, (wdata is don't care)
     assign o_retire_rd_waddr = i_reg_write ? rd : 5'd0;
     assign o_retire_rd_wdata = rd_wdata;
-
-    assign o_retire_next_pc = pc_next; // TODO: Update this later for jumps
+    assign o_retire_next_pc = pc_next; 
 
 
     // Data Memory Signals, (mask is below)
-    assign o_dmem_addr = alu_result; // Address is the result of the ALU
-    assign o_dmem_wdata = rs2_rdata;
+    assign o_dmem_addr = {alu_result[31:2], 2'b00}; // Lower two bits are for byte / half word alignment, so ignore it.
+    assign o_dmem_wdata = write_data; // Write data is determined by the store instruction and ALU result
     assign o_dmem_ren = i_mem_read;
     assign o_dmem_wen = i_mem_write;
     
@@ -417,6 +414,94 @@ module hart #(
     end
     // Assign the memory mask to the output
     assign o_dmem_mask = memory_mask;
+
+
+    // Masking for load instructions so that i_dmem_rdata is valid
+    // Basically same as above but some instructions have to be sign extended / zero extended
+    // funct3[2] = 0 is signed, 1 is unsigned
+
+    // Determine the byte / half word to use, so that we can grab the MSB from that byte / half word
+    // To sign / zero extend. Technically, one might be invalid, but we should just check that every time 
+    // we use it to make sure it is valid (check funct funct3[1:0] for byte / half word, should work)
+    reg [7:0] byte_data;
+    always @(*) begin
+        case(alu_result[1:0])
+            2'b00: byte_data = i_dmem_rdata[7:0]; // Byte 0
+            2'b01: byte_data = i_dmem_rdata[15:8]; // Byte 1
+            2'b10: byte_data = i_dmem_rdata[23:16]; // Byte 2
+            2'b11: byte_data = i_dmem_rdata[31:24]; // Byte 3
+        endcase
+    end
+
+    reg [15:0] half_word_data;
+    always @(*) begin
+        case(alu_result[1:0])
+            2'b00: half_word_data = i_dmem_rdata[15:0]; // Half word 0
+            2'b10: half_word_data = i_dmem_rdata[31:16]; // Half word 1
+            default: half_word_data = 16'h0000; // Shouldn't happen, but avoid latch
+    endcase
+    end
+
+    wire sign_bit = (funct3[2] == 1'b0) ? 
+    (funct3[1:0] == 2'b00) ? byte_data[7] : // Byte, so copy the sign bit
+    (funct3[1:0] == 2'b01) ? half_word_data[15] : // Half word, so copy the sign bit
+    1'b0 : 1'b0; // Unsigned, zero extend it
+
+    reg [31:0] data;
+    always @(*) begin
+        case(funct3[1:0])
+            2'b00: begin // Byte 
+                case(alu_result[1:0])
+                    2'b00: data = {{24{sign_bit}}, byte_data}; // Byte 0
+                    2'b01: data = {{24{sign_bit}}, byte_data}; // Byte 1
+                    2'b10: data = {{24{sign_bit}}, byte_data}; // Byte 2
+                    2'b11: data = {{24{sign_bit}}, byte_data}; // Byte 3
+                endcase
+            end
+            2'b01: begin // Half word
+                case(alu_result[1:0])
+                    2'b00: data = {{16{sign_bit}}, half_word_data}; // Half word 0
+                    2'b10: data = {{16{sign_bit}}, half_word_data}; // Half word 1
+                    default: data = 32'h0; // Shouldn't happen
+                endcase
+            end
+            2'b10: begin // Word, nothing to extend
+                data = i_dmem_rdata;
+            end 
+            default: begin 
+                data = 32'h0; // Shouldn't happen
+            end
+        endcase
+    end
+
+    // Basically same  of load for store instructions. Use funct3 to determine byte / half word, and alu result to determine what to store
+    reg [31:0] write_data;
+    always @(*) begin
+        case(funct3[1:0])
+            2'b00: begin // Byte
+                case(alu_result[1:0])
+                    2'b00: write_data = {24'b0, rs2_rdata[7:0]};
+                    2'b01: write_data = {16'b0, rs2_rdata[7:0], 8'b0}; 
+                    2'b10: write_data = {8'b0, rs2_rdata[7:0], 16'b0}; 
+                    2'b11: write_data = {rs2_rdata[7:0], 24'b0}; 
+                endcase
+            end
+            2'b01: begin // Half word
+                case(alu_result[1:0])
+                    2'b00: write_data = {16'b0, rs2_rdata[15:0]}; 
+                    2'b10: write_data = {rs2_rdata[15:0], 16'b0}; 
+                    default: write_data = 32'h0; 
+                endcase
+            end
+            2'b10: begin // Word
+                write_data = rs2_rdata; // Just write the whole word  
+            end
+            default: write_data = 32'h0; // Shouldn't happen
+        endcase
+
+    end
+
+
 
 endmodule
 
