@@ -160,7 +160,6 @@ module hart #(
     reg i_unsigned;
     reg i_arith;
     reg [5:0] i_format;
-    reg [3:0] i_mem_mask;
     reg i_trap; 
 
     // Use the opcode to determine instruction type
@@ -181,11 +180,9 @@ module hart #(
             i_jalr      = 1'b0;
             i_halt      = 1'b0;
             i_format    = 6'b000000;
-            i_mem_mask  = 4'b0000;
             i_trap      = 1'b0;
             
         case(opcode)
-
             7'b0110011: begin // r
                 i_reg_write = 1'b1; // Write to register from ALU output
                 select_a = 1'b0; // rs1
@@ -197,6 +194,7 @@ module hart #(
                 select_c = 2'b00; // Use ALU output and write to reg
                 i_format = 6'b000001; // R type, for imm.v (one hot)
             end
+
 
             7'b0010011: begin // i, register arithmetic
                 // Same as r type, but select_b uses immediate and no subtraction
@@ -211,12 +209,30 @@ module hart #(
                 i_format = 6'b000010; // I type
             end
             7'b0000011: begin // i, load
+                i_reg_write = 1'b1;
+                select_a = 1'b0;
+                select_b = 1'b1; // Immediate / offset
+                i_opsel = 3'b000; // Add for rs1 + offset for address
+                i_sub = 1'b0;
+                i_mem_read = 1'b1;
+                select_c = 2'b01; // o_rdata from schematic
+                i_format = 6'b000010; // I
             end
             7'b1100111: begin // i, jalr
+                i_reg_write = 1'b1; // PC + 4
+                select_c = 2'b10; // PC + 4
+                i_jalr = 1'b1; // For updating PC to jump target
+                i_format = 6'b000010; // I
             end
 
 
-            7'b0100011: begin // s
+            7'b0100011: begin // s, store, which is write to offset + rs1 and then write rs2 to that address
+                i_mem_write = 1'b1;
+                select_a = 1'b0; // rs1
+                select_b = 1'b1; // immediate
+                i_opsel = 3'b000; // Add for address
+                i_sub = 1'b0;
+                i_format = 6'b000100; // S
             end
 
 
@@ -244,7 +260,11 @@ module hart #(
             end
 
 
-            7'b1101111: begin // j
+            7'b1101111: begin // jal
+                i_reg_write = 1'b1; // Store return address in rd, (pc + 4)
+                select_c = 2'b10; // PC + 4
+                i_jal = 1'b1; // For updating PC to jump target
+                i_format = 6'b100000; // J
             end
             7'b1110011: begin // ebreak, for testing
                 i_halt = (i_imem_rdata[31:20] == 12'b000000000001); // ebreak instruction
@@ -342,12 +362,12 @@ module hart #(
     assign o_retire_next_pc = pc_next; // TODO: Update this later for jumps
 
 
-    // Data Memory Signals (Will be updated later for load/store)
+    // Data Memory Signals, (mask is below)
     assign o_dmem_addr = alu_result; // Address is the result of the ALU
     assign o_dmem_wdata = rs2_rdata;
     assign o_dmem_ren = i_mem_read;
     assign o_dmem_wen = i_mem_write;
-    assign o_dmem_mask = i_mem_mask;
+    
 
 
     // Branch logic, using outputs from ALU (Equal and SLT).
@@ -360,9 +380,43 @@ module hart #(
         (funct3 == 3'b110) ? alu_slt :
         (funct3 == 3'b111) ? !alu_slt : 1'b0);
 
-    wire [31:0] branch_target = pc + immediate;
-    // If branch taken, update PC accordingy
-    wire [31:0] pc_next = (branch_taken) ? branch_target : pc + 4;
+    // Jalr logic
+    wire [31:0] jalr_target = (rs1_rdata + immediate) & 32'hfffffffe; // Clear LSB to make it half-word aligned
+  
+    // If branch taken, update PC accordingy, or check for jump (jal / jalr)
+    wire [31:0] pc_next = (branch_taken || i_jal) ? (pc + immediate) : (i_jalr) ? jalr_target : pc + 4;
+
+
+    // Masking logic to word align o_dmem_addr
+    // Funct3[1:0] determines size of access, with 00 = byte, 01 = half, 10 = word
+    // Also, ALU result is used for which half word or byte to access
+    reg [3:0] memory_mask;
+    always @(*) begin
+        memory_mask = 4'b0000; // Default to no access
+    case(funct3[1:0])
+        2'b00: begin // Byte
+            case(alu_result[1:0])
+                2'b00: memory_mask = 4'b0001; // Byte 0
+                2'b01: memory_mask = 4'b0010; // Byte 1
+                2'b10: memory_mask = 4'b0100; // Byte 2
+                2'b11: memory_mask = 4'b1000; // Byte 3
+            endcase
+        end
+        2'b01: begin // Half word
+            case(alu_result[1:0])
+                2'b00: memory_mask = 4'b0011; // Half word 0
+                2'b10: memory_mask = 4'b1100; // Half word 1
+                default: memory_mask = 4'b0000; // Avoid latch, also shouldn't happen
+            endcase
+        end
+        2'b10: begin // Word
+            memory_mask = 4'b1111; // Always all bytes
+        end
+        default: memory_mask = 4'b0000;// Shouldn't happen anyways, just in case
+    endcase
+    end
+    // Assign the memory mask to the output
+    assign o_dmem_mask = memory_mask;
 
 endmodule
 
