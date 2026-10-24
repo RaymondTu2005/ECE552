@@ -1,0 +1,422 @@
+module hart #(
+    // After reset, the program counter (PC) should be initialized to this
+    // address and start executing instructions from there.
+    parameter RESET_ADDR = 32'h00000000
+) (
+    // Global clock.
+    input  wire        i_clk,
+    // Synchronous active-high reset.
+    input  wire        i_rst,
+    // Instruction fetch goes through a read only instruction memory (imem)
+    // port. The port accepts a 32-bit address (e.g. from the program counter)
+    // per cycle and combinationally returns a 32-bit instruction word. This
+    // is not representative of a realistic memory interface; it has been
+    // modeled as more similar to a DFF or SRAM to simplify phase 3. In
+    // later phases, you will replace this with a more realistic memory.
+    //
+    // 32-bit read address for the instruction memory. This is expected to be
+    // 4 byte aligned - that is, the two LSBs should be zero.
+    output wire [31:0] o_imem_raddr,
+    // Instruction word fetched from memory, available on the same cycle.
+    input  wire [31:0] i_imem_rdata,
+    // Data memory accesses go through a separate read/write data memory (dmem)
+    // that is shared between read (load) and write (stored). The port accepts
+    // a 32-bit address, read or write enable, and mask (explained below) each
+    // cycle. Reads are combinational - values are available immediately after
+    // updating the address and asserting read enable. Writes occur on (and
+    // are visible at) the next clock edge.
+    //
+    // Read/write address for the data memory. This should be 32-bit aligned
+    // (i.e. the two LSB should be zero). See `o_dmem_mask` for how to perform
+    // half-word and byte accesses at unaligned addresses.
+    output wire [31:0] o_dmem_addr,
+    // When asserted, the memory will perform a read at the aligned address
+    // specified by `i_addr` and return the 32-bit word at that address
+    // immediately (i.e. combinationally). It is illegal to assert this and
+    // `o_dmem_wen` on the same cycle.
+    output wire        o_dmem_ren,
+    // When asserted, the memory will perform a write to the aligned address
+    // `o_dmem_addr`. When asserted, the memory will write the bytes in
+    // `o_dmem_wdata` (specified by the mask) to memory at the specified
+    // address on the next rising clock edge. It is illegal to assert this and
+    // `o_dmem_ren` on the same cycle.
+    output wire        o_dmem_wen,
+    // The 32-bit word to write to memory when `o_dmem_wen` is asserted. When
+    // write enable is asserted, the byte lanes specified by the mask will be
+    // written to the memory word at the aligned address at the next rising
+    // clock edge. The other byte lanes of the word will be unaffected.
+    output wire [31:0] o_dmem_wdata,
+    // The dmem interface expects word (32 bit) aligned addresses. However,
+    // the processor supports byte and half-word loads and stores at unaligned and
+    // 16-bit aligned addresses, respectively. To support this, the access
+    // mask specifies which bytes within the 32-bit word are actually read
+    // from or written to memory.
+    //
+    // To perform a half-word read at address 0x00001002, align `o_dmem_addr`
+    // to 0x00001000, assert `o_dmem_ren`, and set the mask to 0b1100 to
+    // indicate that only the upper two bytes should be read. Only the upper
+    // two bytes of `i_dmem_rdata` can be assumed to have valid data; to
+    // calculate the final value of the `lh[u]` instruction, shift the rdata
+    // word right by 16 bits and sign/zero extend as appropriate.
+    //
+    // To perform a byte write at address 0x00002003, align `o_dmem_addr` to
+    // `0x00002000`, assert `o_dmem_wen`, and set the mask to 0b1000 to
+    // indicate that only the upper byte should be written. On the next clock
+    // cycle, the upper byte of `o_dmem_wdata` will be written to memory, with
+    // the other three bytes of the aligned word unaffected. Remember to shift
+    // the value of the `sb` instruction left by 24 bits to place it in the
+    // appropriate byte lane.
+    output wire [ 3:0] o_dmem_mask,
+    // The 32-bit word read from data memory. When `o_dmem_ren` is asserted,
+    // this will immediately reflect the contents of memory at the specified
+    // address, for the bytes enabled by the mask. When read enable is not
+    // asserted, or for bytes not set in the mask, the value is undefined.
+    input  wire [31:0] i_dmem_rdata,
+	// The output `retire` interface is used to signal to the testbench that
+    // the CPU has completed and retired an instruction. A single cycle
+    // implementation will assert this every cycle; however, a pipelined
+    // implementation that needs to stall (due to internal hazards or waiting
+    // on memory accesses) will not assert the signal on cycles where the
+    // instruction in the writeback stage is not retiring.
+    //
+    // Asserted when an instruction is being retired this cycle. If this is
+    // not asserted, the other retire signals are ignored and may be left invalid.
+    output wire        o_retire_valid,
+    // The 32 bit instruction word of the instrution being retired. This
+    // should be the unmodified instruction word fetched from instruction
+    // memory.
+    output wire [31:0] o_retire_inst,
+    // Asserted if the instruction produced a trap, due to an illegal
+    // instruction, unaligned data memory access, or unaligned instruction
+    // address on a taken branch or jump.
+    output wire        o_retire_trap,
+    // Asserted if the instruction is an `ebreak` instruction used to halt the
+    // processor. This is used for debugging and testing purposes to end
+    // a program.
+    output wire        o_retire_halt,
+    // The first register address read by the instruction being retired. If
+    // the instruction does not read from a register (like `lui`), this is
+    // don't-care -- the grading testbench doesn't look at it in that case.
+    output wire [ 4:0] o_retire_rs1_raddr,
+    // The second register address read by the instruction being retired. If
+    // the instruction does not read from a second register (like `addi`),
+    // this is don't-care -- the grading testbench doesn't look at it in that
+    // case.
+    output wire [ 4:0] o_retire_rs2_raddr,
+    // The first source register data read from the register file (in the
+    // decode stage) for the instruction being retired. If rs1 is 5'd0, this
+    // should also be 32'd0.
+    output wire [31:0] o_retire_rs1_rdata,
+    // The second source register data read from the register file (in the
+    // decode stage) for the instruction being retired. If rs2 is 5'd0, this
+    // should also be 32'd0.
+    output wire [31:0] o_retire_rs2_rdata,
+    // The destination register address written by the instruction being
+    // retired. If the instruction does not write to a register (like `sw`),
+    // this should be 5'd0.
+    output wire [ 4:0] o_retire_rd_waddr,
+    // The destination register data written to the register file in the
+    // writeback stage by this instruction. If rd is 5'd0, this field is
+    // ignored and can be treated as a don't care.
+    output wire [31:0] o_retire_rd_wdata,
+    output wire [31:0] o_retire_dmem_addr,
+    output wire [ 3:0] o_retire_dmem_mask,
+    output wire        o_retire_dmem_ren,
+    output wire        o_retire_dmem_wen,
+    output wire [31:0] o_retire_dmem_rdata,
+    output wire [31:0] o_retire_dmem_wdata,
+    // The current program counter of the instruction being retired - i.e.
+    // the instruction memory address that the instruction was fetched from.
+    output wire [31:0] o_retire_pc,
+    // the next program counter after the instruction is retired. For most
+    // instructions, this is `o_retire_pc + 4`, but must be the branch or jump
+    // target for *taken* branches and jumps.
+    output wire [31:0] o_retire_next_pc
+
+`ifdef RISCV_FORMAL
+    ,`RVFI_OUTPUTS,
+`endif
+);
+    // From project 3, we had one single cycle for all of the stages. We still do the same thing in each stage, so the same logic
+    // but have to add some registers to hold values at each stage (maybe between stages, not sure yet), so that we can support pipelining
+    // Reformatted to have 5 stages to make more clear what is happening in each stage (hopefully helpful for future / debugging)
+
+    // 5 Stages: Fetch, Decode, Execute, Memory, Writeback
+
+    // Fetch
+    // Requires the program counter and o_imem_raddr, which is the instruction memory address to read from.
+
+    // Fetch signals
+    wire [31:0] pc_next;
+
+        // Program counter register
+
+    reg [31:0] pc;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            pc <= RESET_ADDR;
+        end else begin
+            pc <= pc_next; 
+        end
+    end
+    assign o_imem_raddr = pc;
+    // Different from project 3 since instruction being fetched currently is not same as instruction being retired, since we have pipelining
+    // Since this is the instruction at the very end, that means we need to keep the pc value at every stage (Register transition)
+    // TODO: Route PC value from the pipeline register at the end stage back to this, so that we can update this value.
+    assign o_retire_pc = pc; // TODO: Update later
+
+    // TODO: PC Next Logic, pc + 4 or branch / jump target, done in execute stage, so find a way to route it back
+    // Like through a mux or something. Same logic, just routed differently
+    assign pc_next = pc + 4; // Update later, when execute stage is done, this is the next instruction we want to fetch
+
+    
+    // Pipeline register, fetch -> decode
+    // We want to basically store the current value at the PC wire, so that it can be used again in the next cycle 
+    // To contain the new instruction (assuming no nops / stalls)
+    // But then we update register at each time, so pc wire before clock is preserved but after clock is ready to be updated
+    // Also need to store 
+    reg [31:0] pc_to_decode;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            pc_to_decode <= RESET_ADDR;
+        end else begin
+            pc_to_decode <= pc; 
+        end
+    end
+
+    // We need to prepare the stuff that decode needs inside this register, since that is going to be updated on the next nxt cycle
+    // That is i_imem_rdata, since that will change in the next cycle for the next instruction, so we preserve it as well.
+    reg [31:0] inst_to_decode; 
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            inst_to_decode <= 32'b0; // Not decoding if we just reset, so no instruction to decode
+        end else begin
+            inst_to_decode <= i_imem_rdata; 
+        end
+    end
+
+
+
+    // Decode stage
+    // Requires the instruction decoder we used where we determined the opcode and other fields, then associated it with a instruction
+
+    // Decoder signals
+    reg i_reg_write; // Write to register
+    reg select_a; // For ALU Mux
+    reg select_b; // For ALU Mux
+    reg [2:0] i_opsel; // For ALU
+    reg i_mem_read; // For data memory read
+    reg i_mem_write; // For data memory write
+    reg [1:0] select_c; // Memory to register mux
+    reg i_branch;
+    reg i_jal;
+    reg i_jalr;
+    reg i_halt;
+    reg i_sub;
+    reg i_unsigned;
+    reg i_arith;
+    reg [5:0] i_format;
+    reg i_trap; 
+
+
+    // Fields, but instead, read from the register F -> D, instead of i_imem_rdata
+    wire [6:0] funct7 = inst_to_decode[31:25];
+    wire [4:0] rs2 = inst_to_decode[24:20];
+    wire [4:0] rs1 = inst_to_decode[19:15];
+    wire [2:0] funct3 = inst_to_decode[14:12];
+    wire [4:0] rd = inst_to_decode[11:7];
+    wire [6:0] opcode = inst_to_decode[6:0];
+
+    // Decoder itself
+    // Use the opcode to determine instruction type
+    always @(*) begin
+            // Default values to avoid latches
+            i_reg_write = 1'b0;
+            select_a    = 1'b0;
+            select_b    = 1'b0;
+            i_opsel     = 3'b000;
+            i_sub       = 1'b0;
+            i_unsigned  = 1'b0;
+            i_arith     = 1'b0;
+            i_mem_read  = 1'b0;
+            i_mem_write = 1'b0;
+            select_c    = 2'b00;
+            i_branch    = 1'b0;
+            i_jal       = 1'b0;
+            i_jalr      = 1'b0;
+            i_halt      = 1'b0;
+            i_format    = 6'b000000;
+            i_trap      = 1'b0;
+            
+        case(opcode)
+            7'b0110011: begin // r
+                i_reg_write = 1'b1; // Write to register from ALU output
+                select_a = 1'b0; // rs1
+                select_b = 1'b0; // rs2
+                i_opsel = funct3; // ALU operation
+                i_sub = funct7[5]; // Determine if add/sub
+                i_unsigned = (funct3 == 3'b011); // For SLT / SLTU
+                i_arith = funct7[5]; // Determine if arithmetic shift
+                select_c = 2'b00; // Use ALU output and write to reg
+                i_format = 6'b000001; // R type, for imm.v (one hot)
+            end
+
+
+            7'b0010011: begin // i, register arithmetic
+                // Same as r type, but select_b uses immediate and no subtraction
+                i_reg_write = 1'b1;
+                select_a = 1'b0; // rs1
+                select_b = 1'b1; // immediate
+                i_opsel = funct3; 
+                i_sub = 1'b0; // No subtraction for i type
+                i_unsigned = (funct3 == 3'b011); // For SLTI / SLTIU
+                i_arith = funct7[5];
+                select_c = 2'b00;
+                i_format = 6'b000010; // I type
+            end
+            7'b0000011: begin // i, load
+                i_reg_write = 1'b1;
+                select_a = 1'b0;
+                select_b = 1'b1; // Immediate / offset
+                i_opsel = 3'b000; // Add for rs1 + offset for address
+                i_sub = 1'b0;
+                i_mem_read = 1'b1;
+                select_c = 2'b01; // o_rdata from schematic
+                i_format = 6'b000010; // I
+            end
+            7'b1100111: begin // i, jalr
+                i_reg_write = 1'b1; // PC + 4
+                select_c = 2'b10; // PC + 4
+                i_jalr = 1'b1; // For updating PC to jump target
+                i_format = 6'b000010; // I
+            end
+
+
+            7'b0100011: begin // s, store, which is write to offset + rs1 and then write rs2 to that address
+                i_mem_write = 1'b1;
+                select_a = 1'b0; // rs1
+                select_b = 1'b1; // immediate
+                i_opsel = 3'b000; // Add for address
+                i_sub = 1'b0;
+                i_format = 6'b000100; // S
+            end
+
+
+            7'b1100011: begin // b 
+                i_branch = 1'b1;
+                select_a = 1'b0; // rs1
+                select_b = 1'b0; // rs2
+                i_unsigned = funct3[1]; // Unsigned, BLTU/BGEU
+                i_format = 6'b001000; // B
+                // no i_opsel because branch instructions only use ALU flags, not the ALU output
+            end
+
+
+            7'b0110111: begin // u, lui - Load upper immediate into rd
+                i_reg_write = 1'b1;
+                select_c = 2'b11; // Use immediate directly
+                i_format = 6'b010000; // U type
+            end
+            7'b0010111: begin // u, auipc - Add upper immediate to PC, write to rd
+                i_reg_write = 1'b1;
+                select_a = 1'b1; // PC
+                select_b = 1'b1; // Immediate
+                select_c = 2'b00;
+                i_format = 6'b010000; // U type
+            end
+
+
+            7'b1101111: begin // jal
+                i_reg_write = 1'b1; // Store return address in rd, (pc + 4)
+                select_c = 2'b10; // PC + 4
+                i_jal = 1'b1; // For updating PC to jump target
+                i_format = 6'b100000; // J
+            end
+            7'b1110011: begin // ebreak, for testing
+
+                i_halt = (inst_to_decode[31:20] == 12'b000000000001); // ebreak instruction
+            end
+            default: begin
+                i_trap = 1'b1; // Illegal instruction
+            end
+        endcase
+    end
+
+        // Instantiations of the immediate and rf, since we can get their outputs now (all of the inputs currently available)
+        // We don't need it in the next stage, but it's easier to pipeline only its output instead of all of the signals needed for input later on
+        // When it actually is used
+
+        // Register File
+    wire [31:0] rs1_rdata;
+    wire [31:0] rs2_rdata;
+    wire [31:0] rd_wdata;
+
+    rf #(
+        .BYPASS_EN(0)
+    ) u_rf (
+        .i_clk      (i_clk),
+        .i_rst      (i_rst),
+        .i_rs1_raddr(rs1),
+        .o_rs1_rdata(rs1_rdata),
+        .i_rs2_raddr(rs2),
+        .o_rs2_rdata(rs2_rdata),
+        // TODO: Update writeback logic, since that is based on the instruction in the writeback stage (at the current cycle), not the instructuction in the decode stage
+        .i_rd_wen   (i_reg_write),
+        .i_rd_waddr (rd),
+        .i_rd_wdata (rd_wdata)
+    );
+
+    // Immediate
+    wire [31:0] immediate;
+
+    imm u_imm (
+        .i_inst      (i_imem_rdata),
+        .i_format    (i_format),
+        .o_immediate (immediate)
+    );
+
+    // ALU 
+
+    alu u_alu (
+        .i_opsel    (i_opsel),
+        .i_sub      (i_sub),
+        .i_unsigned (i_unsigned),
+        .i_arith    (i_arith),
+        .i_op1      (alu_op1),
+        .i_op2      (alu_op2),
+        .o_result   (alu_result),
+        .o_eq       (alu_eq),
+        .o_slt      (alu_slt)
+    );
+
+    // TODO: Add pipeline registers for decode -> execute
+
+    // Decode -> Execute pipeline registers
+
+
+
+    // Execute
+    // ALU logic stuff, and also the branch / jump logic, updating PC
+
+
+
+
+
+
+
+    // Memory
+    // Mask generation for read / write (Store / load), also memory access logic like sign vs zero extend for load/stores, and o_dmem signals
+
+
+
+
+
+
+    // Writeback
+    // RF write back logic and rd_wdata (Writeback data)
+
+
+
+endmodule
+
+`default_nettype wire
