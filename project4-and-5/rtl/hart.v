@@ -389,14 +389,171 @@ module hart #(
         .o_slt      (alu_slt)
     );
 
-    // TODO: Add pipeline registers for decode -> execute
 
-    // Decode -> Execute pipeline registers
+    // Decode -> Execute pipeline registers, separated to make it easier to read
+        // PC and instruction
+    reg [31:0] pc_to_execute;
+    reg [31:0] inst_to_execute;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            pc_to_execute <= RESET_ADDR;
+            inst_to_execute <= 32'b0;
+        end else begin
+            pc_to_execute <= pc_to_decode; 
+            inst_to_execute <= inst_to_decode;
+        end
+    end
+        // Signals for writeback logic
+    reg i_reg_write_to_execute;
+    reg [4:0] rd_to_execute;
+    reg [4:0] rs1_to_execute; // Address
+    reg [4:0] rs2_to_execute; // Address
+        always @(posedge i_clk) begin
+            if (i_rst) begin
+                i_reg_write_to_execute <= 1'b0;
+                rd_to_execute <= 5'b0;
+                rs1_to_execute <= 5'b0;
+                rs2_to_execute <= 5'b0;
+            end else begin
+                i_reg_write_to_execute <= i_reg_write;
+                rd_to_execute <= rd;
+                rs1_to_execute <= rs1;
+                rs2_to_execute <= rs2;
+            end
+        end
+
+        // Signals for muxes
+    reg select_a_to_execute;
+    reg [31:0] rs1_rdata_to_execute;
+    reg select_b_to_execute;
+    reg [31:0] rs2_rdata_to_execute;
+    reg [1:0] select_c_to_execute;
+    reg [31:0] immediate_to_execute;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            select_a_to_execute <= 1'b0;
+            rs1_rdata_to_execute <= 32'b0;
+            select_b_to_execute <= 1'b0;
+            rs2_rdata_to_execute <= 32'b0;
+            select_c_to_execute <= 2'b0;
+            immediate_to_execute <= 32'b0;
+        end else begin
+            select_a_to_execute <= select_a;
+            rs1_rdata_to_execute <= rs1_rdata;
+            select_b_to_execute <= select_b;
+            rs2_rdata_to_execute <= rs2_rdata;
+            select_c_to_execute <= select_c;
+            immediate_to_execute <= immediate;
+        end
+    end
+        // ALU Logic
+    reg [2:0] i_opsel_to_execute;
+    reg i_sub_to_execute;
+    reg i_unsigned_to_execute;
+    reg i_arith_to_execute;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            i_opsel_to_execute <= 3'b000;
+            i_sub_to_execute <= 1'b0;
+            i_unsigned_to_execute <= 1'b0;
+            i_arith_to_execute <= 1'b0;
+        end else begin
+            i_opsel_to_execute <= i_opsel;
+            i_sub_to_execute <= i_sub;
+            i_unsigned_to_execute <= i_unsigned;
+            i_arith_to_execute <= i_arith;
+        end
+    end
+
+        // Branch / Jump Logic
+    reg i_branch_to_execute;
+    reg i_jal_to_execute;
+    reg i_jalr_to_execute;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            i_branch_to_execute <= 1'b0;
+            i_jal_to_execute <= 1'b0;
+            i_jalr_to_execute <= 1'b0;
+        end else begin
+            i_branch_to_execute <= i_branch;
+            i_jal_to_execute <= i_jal;
+            i_jalr_to_execute <= i_jalr;
+        end
+    end
+
+        // Memory Logic
+    reg i_mem_read_to_execute;
+    reg i_mem_write_to_execute;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            i_mem_read_to_execute <= 1'b0;
+            i_mem_write_to_execute <= 1'b0;
+        end else begin
+            i_mem_read_to_execute <= i_mem_read;
+            i_mem_write_to_execute <= i_mem_write;
+        end
+    end
+
+        // Trap / Halt / Retire Logic
+    reg i_trap_to_execute;
+    reg i_halt_to_execute;
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            i_trap_to_execute <= 1'b0;
+            i_halt_to_execute <= 1'b0;
+        end else begin
+            i_trap_to_execute <= i_trap;
+            i_halt_to_execute <= i_halt;
+        end
+    end
+
+        
 
 
-
-    // Execute
+    
+    // Execute stage
     // ALU logic stuff, and also the branch / jump logic, updating PC
+
+    // ALU instantiation
+    wire [31:0] alu_op1;
+    wire [31:0] alu_op2; 
+    wire [31:0] alu_result;
+    wire alu_eq;
+    wire alu_slt;
+
+    alu u_alu (
+        .i_opsel    (i_opsel_to_execute),
+        .i_sub      (i_sub_to_execute),
+        .i_unsigned (i_unsigned_to_execute),
+        .i_arith    (i_arith_to_execute),
+        .i_op1      (alu_op1),
+        .i_op2      (alu_op2),
+        .o_result   (alu_result),
+        .o_eq       (alu_eq),
+        .o_slt      (alu_slt)
+    );
+
+    assign alu_op1 = select_a_to_execute ? pc_to_execute : rs1_rdata_to_execute;
+    assign alu_op2 = select_b_to_execute ? immediate_to_execute : rs2_rdata_to_execute;
+
+    // Jump / Branch logic
+    wire branch_taken = i_branch_to_execute && (
+        (inst_to_execute[14:12] == 3'b000) ? alu_eq : 
+        (inst_to_execute[14:12] == 3'b001) ? !alu_eq :
+        (inst_to_execute[14:12] == 3'b100) ? alu_slt :
+        (inst_to_execute[14:12] == 3'b101) ? !alu_slt :
+        (inst_to_execute[14:12] == 3'b110) ? alu_slt :
+        (inst_to_execute[14:12] == 3'b111) ? !alu_slt : 1'b0);
+    
+
+    wire [31:0] jalr_target = ( rs1_rdata_to_execute + immediate_to_execute) & 32'hfffffffe; // Clear LSB for jalr, word aligned
+    
+    wire [31:0] pc_next_execute = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc_to_execute + 4;
+
+
+
+
+
 
 
 
