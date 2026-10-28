@@ -165,10 +165,8 @@ module hart #(
     // TODO: Route PC value from the pipeline register at the end stage back to this, so that we can update this value.
     assign o_retire_pc = pc; // TODO: Update later
 
-    // TODO: PC Next Logic, pc + 4 or branch / jump target, done in execute stage, so find a way to route it back
-    // Like through a mux or something. Same logic, just routed differently
-    assign pc_next = pc + 4; // Update later, when execute stage is done, this is the next instruction we want to fetch
-
+    // PC_NEXT is based on signals routed from execute stage for branch / jump instructions
+    assign pc_next = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc + 4;
     
     // Pipeline register, fetch -> decode
     // We want to basically store the current value at the PC wire, so that it can be used again in the next cycle 
@@ -551,19 +549,83 @@ module hart #(
     wire [31:0] pc_next_execute = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc_to_execute + 4;
 
 
+    // Execute to Memory Registers
+        // PC
+        reg [31:0] pc_to_memory;
+        reg [31:0] pc_next_to_memory; // For writeback stage, o_retire_next_pc
+        always @(posedge i_clk) begin
+            if (i_rst) begin
+                pc_to_memory <= 32'b0;
+                pc_next_to_memory <= 32'b0;
+            end else begin
+                pc_to_memory <= pc_to_execute;
+                pc_next_to_memory <= pc_next_execute;
+            end
+        end
 
+        // Used for memory reads / writes
+        reg [31:0] alu_result_to_memory; // Load / stores addresses
+        reg [31:0] rs2_rdata_to_memory; // Store data
+        reg i_mem_read_to_memory;
+        reg i_mem_write_to_memory;
+        reg [31:0] inst_to_memory; // Contains funct3, which we need later on, might need for other things as well, so pass whole thing just in case
+        always @(posedge i_clk) begin
+            if (i_rst) begin
+                alu_result_to_memory <= 32'b0;
+                rs2_rdata_to_memory <= 32'b0;
+                i_mem_read_to_memory <= 1'b0;
+                i_mem_write_to_memory <= 1'b0;
+                inst_to_memory <= 32'b0;
+            end else begin
+                alu_result_to_memory <= alu_result;
+                rs2_rdata_to_memory <= rs2_rdata_to_execute;
+                i_mem_read_to_memory <= i_mem_read_to_execute;
+                i_mem_write_to_memory <= i_mem_write_to_execute;
+                inst_to_memory <= inst_to_execute;
+            end
+        end
 
+        // Other signals needed in write back, pass through memory stage
+        reg i_reg_write_to_memory;
+        reg [4:0] rd_to_memory;
+        reg [4:0] rs1_to_memory;
+        reg [4:0] rs2_to_memory;
+        reg [1:0] select_c_to_memory;
 
-
-
-
-
-
+        always @(posedge i_clk) begin 
+            if (i_rst) begin
+                i_reg_write_to_memory <= 1'b0;
+                rd_to_memory <= 4'b0000;
+                rs1_to_memory <= 4'b0000;
+                rs2_to_memory <= 4'b0000;
+                select_c_to_memory <= 2'b0;
+            end else begin
+                i_reg_write_to_memory <= i_reg_write_to_execute;
+                rd_to_memory <= rd_to_execute;
+                rs1_to_memory <= rs1_to_execute;
+                rs2_to_memory <= rs2_to_execute;
+                select_c_to_memory <= select_c_to_execute;
+            end
+        end
+        
+        // Trap / retire
+        reg i_trap_to_memory;
+        reg i_halt_to_memory;
+        always @(posedge i_clk) begin
+            if (i_rst) begin
+                i_trap_to_memory <= 1'b0;
+                i_halt_to_memory <= 1'b0;
+            end else begin
+                i_trap_to_memory <= i_trap_to_execute;
+                i_halt_to_memory <= i_halt_to_execute;
+            end
+        end
 
 
     // Memory
     // Mask generation for read / write (Store / load), also memory access logic like sign vs zero extend for load/stores, and o_dmem signals
-
+    
+    
 
 
 
