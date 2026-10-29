@@ -155,15 +155,15 @@ module hart #(
     always @(posedge i_clk) begin
         if (i_rst) begin
             pc <= RESET_ADDR;
+        end else if (stall_pc) begin 
+            pc <= pc;
         end else begin
-            pc <= pc_next; 
+            pc <= pc_next;
         end
     end
     assign o_imem_raddr = pc;
     // Different from project 3 since instruction being fetched currently is not same as instruction being retired, since we have pipelining
     // Since this is the instruction at the very end, that means we need to keep the pc value at every stage (Register transition)
-    // TODO: Route PC value from the pipeline register at the end stage back to this, so that we can update this value.
-    assign o_retire_pc = pc; // TODO: Update later
 
     // PC_NEXT is based on signals routed from execute stage for branch / jump instructions
     assign pc_next = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc + 4;
@@ -177,19 +177,24 @@ module hart #(
     always @(posedge i_clk) begin
         if (i_rst) begin
             pc_to_decode <= RESET_ADDR;
+        end else if (stall_fetch_decode) begin
+            pc_to_decode <= pc_to_decode;
         end else begin
-            pc_to_decode <= pc; 
+            pc_to_decode <= pc;
         end
     end
 
+
     // We need to prepare the stuff that decode needs inside this register, since that is going to be updated on the next nxt cycle
     // That is i_imem_rdata, since that will change in the next cycle for the next instruction, so we preserve it as well.
-    reg [31:0] inst_to_decode; 
+    reg [31:0] inst_to_decode;
     always @(posedge i_clk) begin
         if (i_rst) begin
             inst_to_decode <= 32'b0; // Not decoding if we just reset, so no instruction to decode
+        end else if (stall_fetch_decode) begin
+            inst_to_decode <= inst_to_decode;
         end else begin
-            inst_to_decode <= i_imem_rdata; 
+            inst_to_decode <= i_imem_rdata;
         end
     end
 
@@ -197,6 +202,9 @@ module hart #(
 
     // Decode stage
     // Requires the instruction decoder we used where we determined the opcode and other fields, then associated it with a instruction
+
+    // We need to identify dependencies and send control signals to pipeline registesr, so that we can stall it until the dependency is finished.
+    // So we stall it in this stage
 
     // Decoder signals
     reg i_reg_write; // Write to register
@@ -342,7 +350,6 @@ module hart #(
 
         // Instantiations of the immediate and rf, since we can get their outputs now (all of the inputs currently available)
         // We don't need it in the next stage, but it's easier to pipeline only its output instead of all of the signals needed for input later on
-        // When it actually is used
 
         // Register File
     wire [31:0] rs1_rdata;
@@ -358,9 +365,9 @@ module hart #(
         .o_rs1_rdata(rs1_rdata),
         .i_rs2_raddr(rs2),
         .o_rs2_rdata(rs2_rdata),
-        // TODO: Update writeback logic, since that is based on the instruction in the writeback stage (at the current cycle), not the instructuction in the decode stage
-        .i_rd_wen   (i_reg_write),
-        .i_rd_waddr (rd),
+        // Writeback logic is updated in the writeback stage, so reference those signals / registers.
+        .i_rd_wen   (i_reg_write_to_writeback),
+        .i_rd_waddr (rd_to_writeback),
         .i_rd_wdata (rd_wdata)
     );
 
@@ -373,19 +380,29 @@ module hart #(
         .o_immediate (immediate)
     );
 
-    // ALU 
+    // For step 2, need to delay in this stage when there is a hazard like RAW that we need to wait for.
+    // Can detect this hazard by basically checking if the registers we are reading from are same as a destination for another instruction
+    // That is in the execute or memory or writeback stage
+    // When it actually is used. So we check if that stage is writing and it is the same register (not x0), and if it is, then stall
 
-    alu u_alu (
-        .i_opsel    (i_opsel),
-        .i_sub      (i_sub),
-        .i_unsigned (i_unsigned),
-        .i_arith    (i_arith),
-        .i_op1      (alu_op1),
-        .i_op2      (alu_op2),
-        .o_result   (alu_result),
-        .o_eq       (alu_eq),
-        .o_slt      (alu_slt)
-    );
+    // NOTE: For project 5, we need to check if rs2 is acutally being used (like addi) doesn't use it. So add logic for that in project 5 - skipping for now since CPI doesn't matter and doesn't affect correctness to delay.
+    wire hazard_execute = i_reg_write_to_execute && (rd_to_execute != 5'b0) && (rs1 == rd_to_execute || rs2 == rd_to_execute);
+    wire hazard_memory = i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1 == rd_to_memory || rs2 == rd_to_memory);
+    wire hazard_writeback = i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1 == rd_to_writeback || rs2 == rd_to_writeback);
+
+    wire hazard_detected = hazard_execute || hazard_memory || hazard_writeback; // For any hazard detected
+
+    // Need to stall signals when a hazard is detected, especially for branch / jumps, since those take two cycles to determine 
+    // We need to check if a branch or jump is in execute stage, since that is when it is resolved and taken or not, which cant be determined in decode
+    wire control_hazard_in_decode = i_branch || i_jal || i_jalr;
+    wire control_hazard_in_execute = i_branch_to_execute || i_jal_to_execute || i_jalr_to_execute;
+
+    // We need to pause fetch -> decode and decode -> execute
+    wire stall_pc = hazard_detected || control_hazard_in_decode; // Keep PC in fetch the same
+    wire stall_fetch_decode = hazard_detected || control_hazard_in_decode || control_hazard_in_execute; // Stall signals from fetch -> Decode
+
+    // For the fetch instructions, we just hold the current values. But for anything beyond execute, want to avoid holding same instruction
+    wire stall_hazard_execute = hazard_detected || control_hazard_in_execute; // In case of branch / jump, we need to wait until outcome is known in execute from ALU operations
 
 
     // Decode -> Execute pipeline registers, separated to make it easier to read
@@ -396,8 +413,11 @@ module hart #(
         if (i_rst) begin
             pc_to_execute <= RESET_ADDR;
             inst_to_execute <= 32'b0;
+        end else if (stall_hazard_execute) begin
+            pc_to_execute <= 32'b0;
+            inst_to_execute <= 32'b0;
         end else begin
-            pc_to_execute <= pc_to_decode; 
+            pc_to_execute <= pc_to_decode;
             inst_to_execute <= inst_to_decode;
         end
     end
@@ -408,6 +428,11 @@ module hart #(
     reg [4:0] rs2_to_execute; // Address
         always @(posedge i_clk) begin
             if (i_rst) begin
+                i_reg_write_to_execute <= 1'b0;
+                rd_to_execute <= 5'b0;
+                rs1_to_execute <= 5'b0;
+                rs2_to_execute <= 5'b0;
+            end else if (stall_hazard_execute) begin
                 i_reg_write_to_execute <= 1'b0;
                 rd_to_execute <= 5'b0;
                 rs1_to_execute <= 5'b0;
@@ -435,6 +460,13 @@ module hart #(
             rs2_rdata_to_execute <= 32'b0;
             select_c_to_execute <= 2'b0;
             immediate_to_execute <= 32'b0;
+        end else if (stall_hazard_execute) begin
+            select_a_to_execute <= 1'b0;
+            rs1_rdata_to_execute <= 32'b0;
+            select_b_to_execute <= 1'b0;
+            rs2_rdata_to_execute <= 32'b0;
+            select_c_to_execute <= 2'b0;
+            immediate_to_execute <= 32'b0;
         end else begin
             select_a_to_execute <= select_a;
             rs1_rdata_to_execute <= rs1_rdata;
@@ -451,6 +483,11 @@ module hart #(
     reg i_arith_to_execute;
     always @(posedge i_clk) begin
         if (i_rst) begin
+            i_opsel_to_execute <= 3'b000;
+            i_sub_to_execute <= 1'b0;
+            i_unsigned_to_execute <= 1'b0;
+            i_arith_to_execute <= 1'b0;
+        end else if (stall_hazard_execute) begin
             i_opsel_to_execute <= 3'b000;
             i_sub_to_execute <= 1'b0;
             i_unsigned_to_execute <= 1'b0;
@@ -472,6 +509,10 @@ module hart #(
             i_branch_to_execute <= 1'b0;
             i_jal_to_execute <= 1'b0;
             i_jalr_to_execute <= 1'b0;
+        end else if (stall_hazard_execute) begin
+            i_branch_to_execute <= 1'b0;
+            i_jal_to_execute <= 1'b0;
+            i_jalr_to_execute <= 1'b0;
         end else begin
             i_branch_to_execute <= i_branch;
             i_jal_to_execute <= i_jal;
@@ -486,6 +527,9 @@ module hart #(
         if (i_rst) begin
             i_mem_read_to_execute <= 1'b0;
             i_mem_write_to_execute <= 1'b0;
+        end else if (stall_hazard_execute) begin
+            i_mem_read_to_execute <= 1'b0;
+            i_mem_write_to_execute <= 1'b0;
         end else begin
             i_mem_read_to_execute <= i_mem_read;
             i_mem_write_to_execute <= i_mem_write;
@@ -495,19 +539,24 @@ module hart #(
         // Trap / Halt / Retire Logic
     reg i_trap_to_execute;
     reg i_halt_to_execute;
+    reg stall_hazard_to_execute;
     always @(posedge i_clk) begin
         if (i_rst) begin
             i_trap_to_execute <= 1'b0;
             i_halt_to_execute <= 1'b0;
+            stall_hazard_to_execute <= 1'b1; // Treat the post-reset pipeline as holding a bubble
+        end else if (stall_hazard_execute) begin
+            i_trap_to_execute <= 1'b0;
+            i_halt_to_execute <= 1'b0;
+            stall_hazard_to_execute <= stall_hazard_execute;
         end else begin
             i_trap_to_execute <= i_trap;
             i_halt_to_execute <= i_halt;
+            stall_hazard_to_execute <= stall_hazard_execute;
         end
     end
 
-        
-
-
+    
     
     // Execute stage
     // ALU logic stuff, and also the branch / jump logic, updating PC
@@ -548,7 +597,6 @@ module hart #(
     
     wire [31:0] pc_next_execute = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc_to_execute + 4;
 
-
     // Execute to Memory Registers
         // PC
         reg [31:0] pc_to_memory;
@@ -565,6 +613,7 @@ module hart #(
 
         // Used for memory reads / writes
         reg [31:0] alu_result_to_memory; // Load / stores addresses
+        reg [31:0] rs1_rdata_to_memory;
         reg [31:0] rs2_rdata_to_memory; // Store data
         reg i_mem_read_to_memory;
         reg i_mem_write_to_memory;
@@ -572,12 +621,14 @@ module hart #(
         always @(posedge i_clk) begin
             if (i_rst) begin
                 alu_result_to_memory <= 32'b0;
+                rs1_rdata_to_memory <= 32'b0;
                 rs2_rdata_to_memory <= 32'b0;
                 i_mem_read_to_memory <= 1'b0;
                 i_mem_write_to_memory <= 1'b0;
                 inst_to_memory <= 32'b0;
             end else begin
                 alu_result_to_memory <= alu_result;
+                rs1_rdata_to_memory <= rs1_rdata_to_execute;
                 rs2_rdata_to_memory <= rs2_rdata_to_execute;
                 i_mem_read_to_memory <= i_mem_read_to_execute;
                 i_mem_write_to_memory <= i_mem_write_to_execute;
@@ -591,6 +642,7 @@ module hart #(
         reg [4:0] rs1_to_memory;
         reg [4:0] rs2_to_memory;
         reg [1:0] select_c_to_memory;
+        reg [31:0] immediate_to_memory;
 
         always @(posedge i_clk) begin 
             if (i_rst) begin
@@ -599,25 +651,30 @@ module hart #(
                 rs1_to_memory <= 4'b0000;
                 rs2_to_memory <= 4'b0000;
                 select_c_to_memory <= 2'b0;
+                immediate_to_memory <= 32'b0;
             end else begin
                 i_reg_write_to_memory <= i_reg_write_to_execute;
                 rd_to_memory <= rd_to_execute;
                 rs1_to_memory <= rs1_to_execute;
                 rs2_to_memory <= rs2_to_execute;
                 select_c_to_memory <= select_c_to_execute;
+                immediate_to_memory <= immediate_to_execute;
             end
         end
         
         // Trap / retire
         reg i_trap_to_memory;
         reg i_halt_to_memory;
+        reg stall_hazard_to_memory;
         always @(posedge i_clk) begin
             if (i_rst) begin
                 i_trap_to_memory <= 1'b0;
                 i_halt_to_memory <= 1'b0;
+                stall_hazard_to_memory <= 1'b1; // Treat the post-reset pipeline as holding a bubble
             end else begin
                 i_trap_to_memory <= i_trap_to_execute;
                 i_halt_to_memory <= i_halt_to_execute;
+                stall_hazard_to_memory <= stall_hazard_to_execute;
             end
         end
 
@@ -625,14 +682,269 @@ module hart #(
     // Memory
     // Mask generation for read / write (Store / load), also memory access logic like sign vs zero extend for load/stores, and o_dmem signals
     
+    // Masking logic to word align o_dmem_addr
+    // Funct3[1:0] determines size of access, with 00 = byte, 01 = half, 10 = word. Passed by inst_to_memory from EX to MEM registrs.
+    // Also, ALU result is used for which half word or byte to access
+    reg [3:0] memory_mask;
+    always @(*) begin
+        memory_mask = 4'b0000; // Default to no access
+    case(inst_to_memory[13:12])
+        2'b00: begin // Byte
+            case(alu_result_to_memory[1:0])
+                2'b00: memory_mask = 4'b0001; 
+                2'b01: memory_mask = 4'b0010; 
+                2'b10: memory_mask = 4'b0100; 
+                2'b11: memory_mask = 4'b1000; 
+                default: memory_mask = 4'b0000; // For gradescope compiler
+            endcase
+        end
+        2'b01: begin // Half word
+            case(alu_result_to_memory[1:0])
+                2'b00: memory_mask = 4'b0011;
+                2'b10: memory_mask = 4'b1100; 
+                default: memory_mask = 4'b0000; // Avoid latch, also shouldn't happen
+            endcase
+        end
+        2'b10: begin // Word
+            memory_mask = 4'b1111; // Always all bytes
+        end
+        default: memory_mask = 4'b0000;// Shouldn't happen anyways, just in case
+    endcase
+    end
+
+    // Masking + Sign Extension for load instructions, (i_dmem_rdata)
+    // Funct3 determines signed or not, 0 = signed, 1 = unsigned
+
+    // Determine the byte / half word to use, so that we can grab the MSB from that byte / half word
+    // To sign / zero extend. Technically, one might be invalid, but we should just check that every time 
+    // we use it to make sure it is valid (check funct funct3[1:0] for byte / half word, should work)
+    reg [7:0] byte_data;
+    always @(*) begin
+        byte_data = 8'h00; // Default to avoid latches
+        case(alu_result_to_memory[1:0])
+            2'b00: byte_data = i_dmem_rdata[7:0]; 
+            2'b01: byte_data = i_dmem_rdata[15:8]; 
+            2'b10: byte_data = i_dmem_rdata[23:16]; 
+            2'b11: byte_data = i_dmem_rdata[31:24]; 
+            default: byte_data = 8'h00; // For gradescope compiler
+        endcase
+    end
+
+    reg [15:0] half_word_data;
+    always @(*) begin
+        half_word_data = 16'h0000; // Default to avoid latches
+        case(alu_result_to_memory[1:0])
+            2'b00: half_word_data = i_dmem_rdata[15:0]; 
+            2'b10: half_word_data = i_dmem_rdata[31:16]; 
+            default: half_word_data = 16'h0000; // Shouldn't happen, but avoid latch
+    endcase
+    end
+
+    wire sign_bit = (inst_to_memory[14] == 1'b0) ? // Funct3[2] = 0 is signed, 1 is unsigned.
+    (inst_to_memory[13:12] == 2'b00) ? byte_data[7] : // Byte, so copy the sign bit
+    (inst_to_memory[13:12] == 2'b01) ? half_word_data[15] : // Half word, so copy the sign bit
+    1'b0 : 1'b0; // Unsigned, zero extend it
+
+    reg [31:0] data;
+    always @(*) begin
+        data = 32'h0; // Default to avoid latches
+        case(inst_to_memory[13:12])
+            2'b00: begin // Byte
+                case(alu_result_to_memory[1:0])
+                    2'b00: data = {{24{sign_bit}}, byte_data};
+                    2'b01: data = {{24{sign_bit}}, byte_data}; 
+                    2'b10: data = {{24{sign_bit}}, byte_data}; 
+                    2'b11: data = {{24{sign_bit}}, byte_data}; 
+                    default: data = 32'h0; // For gradescope compiler
+                endcase
+            end
+            2'b01: begin // Half word
+                case(alu_result_to_memory[1:0])
+                    2'b00: data = {{16{sign_bit}}, half_word_data}; 
+                    2'b10: data = {{16{sign_bit}}, half_word_data}; 
+                    default: data = 32'h0; // Shouldn't happen
+                endcase
+            end
+            2'b10: begin // Word, nothing to extend
+                data = i_dmem_rdata;
+            end 
+            default: begin 
+                data = 32'h0; // Shouldn't happen
+            end
+        endcase
+    end
+
+
+    // Basically same logic as load for store instructions. Use funct3 to determine byte / half word, and alu result to determine what to store
+    reg [31:0] write_data;
+    always @(*) begin
+        write_data = 32'h0; // Default to avoid latches
+        case(inst_to_memory[13:12])
+            2'b00: begin // Byte
+                case(alu_result_to_memory[1:0])
+                    2'b00: write_data = rs2_rdata_to_memory; // Don't fill in upper bits, just keep it as is (failed gradescope before in proj 3)
+                    2'b01: write_data = {rs2_rdata_to_memory[23:0], 8'b0}; 
+                    2'b10: write_data = {rs2_rdata_to_memory[15:0], 16'b0}; 
+                    2'b11: write_data = {rs2_rdata_to_memory[7:0], 24'b0}; 
+                    default: write_data = 32'h0; // For gradescope compiler
+                endcase
+            end
+            2'b01: begin // Half word
+                case(alu_result_to_memory[1:0])
+                    2'b00: write_data = rs2_rdata_to_memory;
+                    2'b10: write_data = {rs2_rdata_to_memory[15:0], 16'b0}; 
+                    default: write_data = 32'h0; 
+                endcase
+            end
+            2'b10: begin // Word
+                write_data = rs2_rdata_to_memory; // Just write the whole word
+            end
+            default: write_data = 32'h0; // Shouldn't happen
+        endcase
+    end
     
+    // Data memory signals
+    assign o_dmem_addr = {alu_result_to_memory[31:2], 2'b00};
+    assign o_dmem_wdata = write_data;
+    assign o_dmem_ren = i_mem_read_to_memory;
+    assign o_dmem_wen = i_mem_write_to_memory;
+    assign o_dmem_mask = memory_mask;
 
 
 
+    // Memory to writeback registers
+    // PC
+    reg [31:0] pc_to_writeback;
+    reg [31:0] pc_next_to_writeback;
+    always @(posedge i_clk) begin 
+        if (i_rst) begin
+            pc_to_writeback <= 32'b0;
+            pc_next_to_writeback <= 32'b0;
+        end else begin
+            pc_to_writeback <= pc_to_memory;
+            pc_next_to_writeback <= pc_next_to_memory;
+        end
+    end
+
+    // Mux and signals for writeback
+    reg i_reg_write_to_writeback;
+    reg [31:0] alu_result_to_writeback;
+    reg [1:0] select_c_to_writeback;
+    reg [31:0] data_to_writeback; // Load data
+    reg [31:0] immediate_to_writeback;
+    
+    always @(posedge i_clk) begin 
+        if (i_rst) begin
+            i_reg_write_to_writeback <= 1'b0;
+            alu_result_to_writeback <= 32'b0;
+            select_c_to_writeback <= 2'b0;
+            data_to_writeback <= 32'b0;
+            immediate_to_writeback <= 32'b0;
+        end else begin
+            i_reg_write_to_writeback <= i_reg_write_to_memory;
+            alu_result_to_writeback <= alu_result_to_memory;
+            select_c_to_writeback <= select_c_to_memory;
+            data_to_writeback <= data;
+            immediate_to_writeback <= immediate_to_memory;
+        end
+    end
+
+    // Data memory outputs (Only valid in memory stage), need for retire as well
+    reg [31:0] o_dmem_rdata_to_writeback;
+    reg [31:0] o_dmem_addr_to_writeback;
+    reg [3:0] o_dmem_mask_to_writeback;
+    reg [31:0] o_dmem_wdata_to_writeback;
+    reg o_dmem_ren_to_writeback;
+    reg o_dmem_wen_to_writeback;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            o_dmem_rdata_to_writeback <= 32'b0;
+            o_dmem_addr_to_writeback <= 32'b0;
+            o_dmem_mask_to_writeback <= 4'b0;
+            o_dmem_wdata_to_writeback <= 32'b0;
+            o_dmem_ren_to_writeback <= 1'b0;
+            o_dmem_wen_to_writeback <= 1'b0;
+        end else begin
+            o_dmem_rdata_to_writeback <= i_dmem_rdata;
+            o_dmem_addr_to_writeback <= o_dmem_addr;
+            o_dmem_mask_to_writeback <= o_dmem_mask;
+            o_dmem_wdata_to_writeback <= o_dmem_wdata;
+            o_dmem_ren_to_writeback <= o_dmem_ren;
+            o_dmem_wen_to_writeback <= o_dmem_wen;
+        end
+    end
+
+    // Trap / retire
+    reg i_trap_to_writeback;
+    reg i_halt_to_writeback;
+    reg [4:0] rs1_to_writeback; // Retire
+    reg [4:0] rs2_to_writeback; // Retire
+    reg [31:0] inst_to_writeback; // Retire
+    reg [4:0] rd_to_writeback; /// Reture 
+    reg [31:0] rs1_rdata_to_writeback; // Retire as well for data
+    reg [31:0] rs2_rdata_to_writeback; // Retire as well for data
+    reg stall_hazard_to_writeback;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            i_trap_to_writeback <= 1'b0;
+            i_halt_to_writeback <= 1'b0;
+            rs1_to_writeback <= 5'b0;
+            rs2_to_writeback <= 5'b0;
+            inst_to_writeback <= 32'b0;
+            rd_to_writeback <= 5'b0;
+            rs1_rdata_to_writeback <= 32'b0;
+            rs2_rdata_to_writeback <= 32'b0;
+            stall_hazard_to_writeback <= 1'b1; // Treat the post-reset pipeline as holding a bubble
+        end else begin
+            i_trap_to_writeback <= i_trap_to_memory;
+            i_halt_to_writeback <= i_halt_to_memory;
+            rs1_to_writeback <= rs1_to_memory;
+            rs2_to_writeback <= rs2_to_memory;
+            inst_to_writeback <= inst_to_memory;
+            rd_to_writeback <= rd_to_memory;
+            rs1_rdata_to_writeback <= rs1_rdata_to_memory;
+            rs2_rdata_to_writeback <= rs2_rdata_to_memory;
+            stall_hazard_to_writeback <= stall_hazard_to_memory;
+        end
+    end
 
 
     // Writeback
     // RF write back logic and rd_wdata (Writeback data)
+    // Data based on select c mux
+    assign rd_wdata = (select_c_to_writeback == 2'b00) ? alu_result_to_writeback : 
+    (select_c_to_writeback == 2'b01) ? data_to_writeback : 
+    (select_c_to_writeback == 2'b10) ? pc_to_writeback + 4 : 
+    immediate_to_writeback;
+
+    // All of the retire signals
+    assign o_retire_valid = !stall_hazard_to_writeback; // If we are not stalling, then valid, else invalid
+    assign o_retire_inst = inst_to_writeback;
+    assign o_retire_trap = i_trap_to_writeback;
+    assign o_retire_halt = i_halt_to_writeback;
+
+    // Register retires
+    assign o_retire_rs1_raddr = rs1_to_writeback;
+    assign o_retire_rs2_raddr = rs2_to_writeback;
+    assign o_retire_rs1_rdata = rs1_rdata_to_writeback;
+    assign o_retire_rs2_rdata = rs2_rdata_to_writeback;
+    assign o_retire_rd_waddr = i_reg_write_to_writeback ? rd_to_writeback : 5'b0; // When not writing must be empty
+    assign o_retire_rd_wdata = rd_wdata;
+
+    // Data memory retires
+    assign o_retire_dmem_addr = o_dmem_addr_to_writeback;
+    assign o_retire_dmem_mask = o_dmem_mask_to_writeback;
+    assign o_retire_dmem_wen = o_dmem_wen_to_writeback;
+    assign o_retire_dmem_ren = o_dmem_ren_to_writeback;
+    assign o_retire_dmem_rdata = o_dmem_rdata_to_writeback;
+    assign o_retire_dmem_wdata = o_dmem_wdata_to_writeback;
+
+    // PC
+    assign o_retire_pc = pc_to_writeback;
+    assign o_retire_next_pc = pc_next_to_writeback;
+
 
 
 
