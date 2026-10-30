@@ -141,6 +141,27 @@ module hart #(
     // but have to add some registers to hold values at each stage (maybe between stages, not sure yet), so that we can support pipelining
     // Reformatted to have 5 stages to make more clear what is happening in each stage (hopefully helpful for future / debugging)
 
+    // Have to declare signals before use for gradescope compiler, gave us an error before
+    wire        stall_pc;
+    wire        stall_fetch_decode;
+    wire        hazard_detected;
+    wire        control_hazard_in_decode;
+    wire        control_hazard_in_execute;
+    wire        branch_taken;
+    wire        redirect_in_execute;
+    wire [31:0] jalr_target;
+    reg  [31:0] pc_to_execute;
+    reg  [31:0] immediate_to_execute;
+    reg         i_jal_to_execute;
+    reg         i_jalr_to_execute;
+    reg         i_branch_to_execute;
+    reg  [4:0]  rd_to_execute;
+    reg  [4:0]  rd_to_memory;
+    reg  [4:0]  rd_to_writeback;
+    reg         i_reg_write_to_execute;
+    reg         i_reg_write_to_memory;
+    reg         i_reg_write_to_writeback;
+
     // 5 Stages: Fetch, Decode, Execute, Memory, Writeback
 
     // Fetch
@@ -177,7 +198,13 @@ module hart #(
     always @(posedge i_clk) begin
         if (i_rst) begin
             pc_to_decode <= RESET_ADDR;
-        end else if (stall_fetch_decode) begin
+        end else if (redirect_in_execute) begin
+            // We are actualy redirecting, so next pc to decode doens't matter / is discarded
+            pc_to_decode <= 32'b0;
+        end else if (control_hazard_in_execute) begin
+            // Since redirect_in_execute did not assert, mean we have a branch that didn't take it, so we don't discard the current PC.
+            pc_to_decode <= pc;
+        end else if (hazard_detected || control_hazard_in_decode) begin
             pc_to_decode <= pc_to_decode;
         end else begin
             pc_to_decode <= pc;
@@ -188,13 +215,29 @@ module hart #(
     // We need to prepare the stuff that decode needs inside this register, since that is going to be updated on the next nxt cycle
     // That is i_imem_rdata, since that will change in the next cycle for the next instruction, so we preserve it as well.
     reg [31:0] inst_to_decode;
+    // Signal so that if we reset, we know there is no valid instruction to decode and we don't trap, which caused a reset error in our test cases.
+    reg decode_has_inst;
     always @(posedge i_clk) begin
         if (i_rst) begin
             inst_to_decode <= 32'b0; // Not decoding if we just reset, so no instruction to decode
-        end else if (stall_fetch_decode) begin
+            decode_has_inst <= 1'b0;
+        end else if (redirect_in_execute) begin
+            // Again, we redirected so doesn't matter what we currently send to decode, since that is discarded
+            inst_to_decode <= 32'b0;
+            decode_has_inst <= 1'b0; // On reset, it shouldn't have a valid instruction to decode, done so that we avoid the trap.
+        end else if (control_hazard_in_execute) begin
+            // Didn't take the branch, so we have to keep the current instruction and send it to decode since its not discarded.
+            inst_to_decode <= i_imem_rdata;
+            decode_has_inst <= 1'b1;
+        end else if (hazard_detected || control_hazard_in_decode) begin
+            // This means there is either a data hazard or a branch instruction is still waiting in execute for results, so keep same value
+            // This fixed the bug where we had an infinite loop where the branch instruction in execute resolved, but i_branch still was held
+            // So that the instruction in decode is not overwritten and then it caused the hazard to keep persisting.
             inst_to_decode <= inst_to_decode;
+            decode_has_inst <= decode_has_inst;
         end else begin
             inst_to_decode <= i_imem_rdata;
+            decode_has_inst <= 1'b1;
         end
     end
 
@@ -202,7 +245,6 @@ module hart #(
 
     // Decode stage
     // Requires the instruction decoder we used where we determined the opcode and other fields, then associated it with a instruction
-
     // We need to identify dependencies and send control signals to pipeline registesr, so that we can stall it until the dependency is finished.
     // So we stall it in this stage
 
@@ -375,7 +417,7 @@ module hart #(
     wire [31:0] immediate;
 
     imm u_imm (
-        .i_inst      (i_imem_rdata),
+        .i_inst      (inst_to_decode),
         .i_format    (i_format),
         .o_immediate (immediate)
     );
@@ -390,16 +432,18 @@ module hart #(
     wire hazard_memory = i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1 == rd_to_memory || rs2 == rd_to_memory);
     wire hazard_writeback = i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1 == rd_to_writeback || rs2 == rd_to_writeback);
 
-    wire hazard_detected = hazard_execute || hazard_memory || hazard_writeback; // For any hazard detected
+    assign hazard_detected = hazard_execute || hazard_memory || hazard_writeback; // For any hazard detected
 
-    // Need to stall signals when a hazard is detected, especially for branch / jumps, since those take two cycles to determine 
+    // Need to stall signals when a hazard is detected, especially for branch / jumps, since those take two cycles to determine
     // We need to check if a branch or jump is in execute stage, since that is when it is resolved and taken or not, which cant be determined in decode
-    wire control_hazard_in_decode = i_branch || i_jal || i_jalr;
-    wire control_hazard_in_execute = i_branch_to_execute || i_jal_to_execute || i_jalr_to_execute;
+    assign control_hazard_in_decode = i_branch || i_jal || i_jalr;
+    assign control_hazard_in_execute = i_branch_to_execute || i_jal_to_execute || i_jalr_to_execute;
 
     // We need to pause fetch -> decode and decode -> execute
-    wire stall_pc = hazard_detected || control_hazard_in_decode; // Keep PC in fetch the same
-    wire stall_fetch_decode = hazard_detected || control_hazard_in_decode || control_hazard_in_execute; // Stall signals from fetch -> Decode
+    // stall_pc has to be !control_hazard_in_execute or we get a one off cycle, since control_hazard_in_decode is asserted 1 cycle too late (asserted alongside hazard_in_execute, so make conditional for both)
+    assign stall_pc = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute); // Keep PC in fetch the same, but release once the branch/jump has actually moved on to execute (if executed for branches)
+    assign stall_fetch_decode = hazard_detected || control_hazard_in_decode || redirect_in_execute; // Stall signals from fetch -> Decode. We don't stall when branch not taken (!redirect_in_execute)
+
 
     // For the fetch instructions, we just hold the current values. But for anything beyond execute, want to avoid holding same instruction
     wire stall_hazard_execute = hazard_detected || control_hazard_in_execute; // In case of branch / jump, we need to wait until outcome is known in execute from ALU operations
@@ -407,7 +451,6 @@ module hart #(
 
     // Decode -> Execute pipeline registers, separated to make it easier to read
         // PC and instruction
-    reg [31:0] pc_to_execute;
     reg [31:0] inst_to_execute;
     always @(posedge i_clk) begin
         if (i_rst) begin
@@ -422,8 +465,6 @@ module hart #(
         end
     end
         // Signals for writeback logic
-    reg i_reg_write_to_execute;
-    reg [4:0] rd_to_execute;
     reg [4:0] rs1_to_execute; // Address
     reg [4:0] rs2_to_execute; // Address
         always @(posedge i_clk) begin
@@ -451,7 +492,6 @@ module hart #(
     reg select_b_to_execute;
     reg [31:0] rs2_rdata_to_execute;
     reg [1:0] select_c_to_execute;
-    reg [31:0] immediate_to_execute;
     always @(posedge i_clk) begin
         if (i_rst) begin
             select_a_to_execute <= 1'b0;
@@ -501,9 +541,6 @@ module hart #(
     end
 
         // Branch / Jump Logic
-    reg i_branch_to_execute;
-    reg i_jal_to_execute;
-    reg i_jalr_to_execute;
     always @(posedge i_clk) begin
         if (i_rst) begin
             i_branch_to_execute <= 1'b0;
@@ -552,7 +589,7 @@ module hart #(
         end else begin
             i_trap_to_execute <= i_trap;
             i_halt_to_execute <= i_halt;
-            stall_hazard_to_execute <= stall_hazard_execute;
+            stall_hazard_to_execute <= stall_hazard_execute || !decode_has_inst; // If decode doesn't have instruction, signal there is a hazard and input some value that will be discarded
         end
     end
 
@@ -584,16 +621,18 @@ module hart #(
     assign alu_op2 = select_b_to_execute ? immediate_to_execute : rs2_rdata_to_execute;
 
     // Jump / Branch logic
-    wire branch_taken = i_branch_to_execute && (
+    assign branch_taken = i_branch_to_execute && (
         (inst_to_execute[14:12] == 3'b000) ? alu_eq : 
         (inst_to_execute[14:12] == 3'b001) ? !alu_eq :
         (inst_to_execute[14:12] == 3'b100) ? alu_slt :
         (inst_to_execute[14:12] == 3'b101) ? !alu_slt :
         (inst_to_execute[14:12] == 3'b110) ? alu_slt :
         (inst_to_execute[14:12] == 3'b111) ? !alu_slt : 1'b0);
-    
 
-    wire [31:0] jalr_target = ( rs1_rdata_to_execute + immediate_to_execute) & 32'hfffffffe; // Clear LSB for jalr, word aligned
+    // Fixes a bug when branch instructions would not jump (Since they are conditional), causing tests to fail (since I assumed it would always pass before)
+    assign redirect_in_execute = branch_taken || i_jal_to_execute || i_jalr_to_execute;
+
+    assign jalr_target = ( rs1_rdata_to_execute + immediate_to_execute) & 32'hfffffffe; // Clear LSB for jalr, word aligned
     
     wire [31:0] pc_next_execute = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc_to_execute + 4;
 
@@ -637,8 +676,6 @@ module hart #(
         end
 
         // Other signals needed in write back, pass through memory stage
-        reg i_reg_write_to_memory;
-        reg [4:0] rd_to_memory;
         reg [4:0] rs1_to_memory;
         reg [4:0] rs2_to_memory;
         reg [1:0] select_c_to_memory;
@@ -827,7 +864,6 @@ module hart #(
     end
 
     // Mux and signals for writeback
-    reg i_reg_write_to_writeback;
     reg [31:0] alu_result_to_writeback;
     reg [1:0] select_c_to_writeback;
     reg [31:0] data_to_writeback; // Load data
@@ -881,7 +917,6 @@ module hart #(
     reg [4:0] rs1_to_writeback; // Retire
     reg [4:0] rs2_to_writeback; // Retire
     reg [31:0] inst_to_writeback; // Retire
-    reg [4:0] rd_to_writeback; /// Reture 
     reg [31:0] rs1_rdata_to_writeback; // Retire as well for data
     reg [31:0] rs2_rdata_to_writeback; // Retire as well for data
     reg stall_hazard_to_writeback;
