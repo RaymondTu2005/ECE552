@@ -161,6 +161,8 @@ module hart #(
     reg         i_reg_write_to_execute;
     reg         i_reg_write_to_memory;
     reg         i_reg_write_to_writeback;
+    reg [31:0] alu_result_to_memory; // Load / stores addresses
+
 
     // 5 Stages: Fetch, Decode, Execute, Memory, Writeback
 
@@ -399,7 +401,7 @@ module hart #(
     wire [31:0] rd_wdata;
 
     rf #(
-        .BYPASS_EN(0)
+        .BYPASS_EN(1) // Enables bypassing, so WB writes the results in the RF in the first half and then the instruction at decode reads its operands
     ) u_rf (
         .i_clk      (i_clk),
         .i_rst      (i_rst),
@@ -427,12 +429,17 @@ module hart #(
     // That is in the execute or memory or writeback stage
     // When it actually is used. So we check if that stage is writing and it is the same register (not x0), and if it is, then stall
 
-    // NOTE: For project 5, we need to check if rs2 is acutally being used (like addi) doesn't use it. So add logic for that in project 5 - skipping for now since CPI doesn't matter and doesn't affect correctness to delay.
-    wire hazard_execute = i_reg_write_to_execute && (rd_to_execute != 5'b0) && (rs1 == rd_to_execute || rs2 == rd_to_execute);
-    wire hazard_memory = i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1 == rd_to_memory || rs2 == rd_to_memory);
-    wire hazard_writeback = i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1 == rd_to_writeback || rs2 == rd_to_writeback);
+    // // NOTE: For project 5, we need to check if rs2 is acutally being used (like addi) doesn't use it. So add logic for that in project 5 - skipping for now since CPI doesn't matter and doesn't affect correctness to delay.
+    // Disabling for now for project 5, will reuse if needed (not sure). I don't think we need it since we have forwarding now:
+    // Hazard_execute is resolved by ex to ex forwarding
+    // Hazard_memory is resolved by mem to ex forwarding
+    // Hazard_writeback is resolved by bypassing, where we can write to RF in first half and then read from it in second half of clock cycle
+    
+    // wire hazard_execute = i_reg_write_to_execute && (rd_to_execute != 5'b0) && (rs1 == rd_to_execute || rs2 == rd_to_execute);
+    // wire hazard_memory = i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1 == rd_to_memory || rs2 == rd_to_memory);
+    // wire hazard_writeback = i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1 == rd_to_writeback || rs2 == rd_to_writeback);
 
-    assign hazard_detected = hazard_execute || hazard_memory || hazard_writeback; // For any hazard detected
+    assign hazard_detected = i_mem_read_to_execute && (rd_to_execute != 5'b0) && (rs1 == rd_to_execute || rs2 == rd_to_execute);
 
     // Need to stall signals when a hazard is detected, especially for branch / jumps, since those take two cycles to determine
     // We need to check if a branch or jump is in execute stage, since that is when it is resolved and taken or not, which cant be determined in decode
@@ -616,9 +623,24 @@ module hart #(
         .o_eq       (alu_eq),
         .o_slt      (alu_slt)
     );
+    
+    // For proejct 5, this can come from EX stage or MEM stage due to forwarding, so update logic accordingly for RS1 / RS2 for ALU Operations
+    wire forward_ex_ex_rs1 = (i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1_to_execute == rd_to_memory)); // If producer / dependent instruction is in memory stage, writing to a valid register and is the same register.
+    wire forward_mem_ex_rs1 = (i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1_to_execute == rd_to_writeback)); // Producer WAS in memory stage, is now in writeback. So same logic
 
-    assign alu_op1 = select_a_to_execute ? pc_to_execute : rs1_rdata_to_execute;
-    assign alu_op2 = select_b_to_execute ? immediate_to_execute : rs2_rdata_to_execute;
+    // Same logic as above
+    wire forward_ex_ex_rs2 = (i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs2_to_execute == rd_to_memory));
+    wire forward_mem_ex_rs2 = (i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs2_to_execute == rd_to_writeback));
+
+    // Wire for checking if RS1 / RS2 was actually forwarded
+    wire [31:0] rs1_forwarded = forward_ex_ex_rs1 ? alu_result_to_memory : 
+    forward_mem_ex_rs1 ? rd_wdata : rs1_rdata_to_execute; // If not forwarded, use the value from decode stage, or grab forwarded value
+
+    wire [31:0] rs2_forwarded = forward_ex_ex_rs2 ? alu_result_to_memory :
+    forward_mem_ex_rs2 ? rd_wdata : rs2_rdata_to_execute;
+
+    assign alu_op1 = select_a_to_execute ? pc_to_execute : rs1_forwarded; 
+    assign alu_op2 = select_b_to_execute ? immediate_to_execute : rs2_forwarded;
 
     // Jump / Branch logic
     assign branch_taken = i_branch_to_execute && (
@@ -632,7 +654,8 @@ module hart #(
     // Fixes a bug when branch instructions would not jump (Since they are conditional), causing tests to fail (since I assumed it would always pass before)
     assign redirect_in_execute = branch_taken || i_jal_to_execute || i_jalr_to_execute;
 
-    assign jalr_target = ( rs1_rdata_to_execute + immediate_to_execute) & 32'hfffffffe; // Clear LSB for jalr, word aligned
+    // Target can now be forwarded, so use forwarded value
+    assign jalr_target = ( rs1_forwarded + immediate_to_execute) & 32'hfffffffe; // Clear LSB for jalr, word aligned
     
     wire [31:0] pc_next_execute = (branch_taken || i_jal_to_execute) ? (pc_to_execute + immediate_to_execute) : (i_jalr_to_execute) ? jalr_target : pc_to_execute + 4;
 
@@ -651,7 +674,6 @@ module hart #(
         end
 
         // Used for memory reads / writes
-        reg [31:0] alu_result_to_memory; // Load / stores addresses
         reg [31:0] rs1_rdata_to_memory;
         reg [31:0] rs2_rdata_to_memory; // Store data
         reg i_mem_read_to_memory;
