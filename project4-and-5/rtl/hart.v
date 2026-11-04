@@ -267,6 +267,11 @@ module hart #(
     reg i_arith;
     reg [5:0] i_format;
     reg i_trap; 
+    reg i_mem_read_to_execute;
+    reg [31:0] pc_to_memory;
+    reg [1:0]  select_c_to_memory;
+    reg [31:0] immediate_to_memory;
+    reg [31:0] data;
 
 
     // Fields, but instead, read from the register F -> D, instead of i_imem_rdata
@@ -429,7 +434,6 @@ module hart #(
     // That is in the execute or memory or writeback stage
     // When it actually is used. So we check if that stage is writing and it is the same register (not x0), and if it is, then stall
 
-    // // NOTE: For project 5, we need to check if rs2 is acutally being used (like addi) doesn't use it. So add logic for that in project 5 - skipping for now since CPI doesn't matter and doesn't affect correctness to delay.
     // Disabling for now for project 5, will reuse if needed (not sure). I don't think we need it since we have forwarding now:
     // Hazard_execute is resolved by ex to ex forwarding
     // Hazard_memory is resolved by mem to ex forwarding
@@ -439,12 +443,16 @@ module hart #(
     // wire hazard_memory = i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1 == rd_to_memory || rs2 == rd_to_memory);
     // wire hazard_writeback = i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1 == rd_to_writeback || rs2 == rd_to_writeback);
 
+    // The only hazard not covered now is a load-use hazard
+    // Where we use a value before it is actually loaded to memory, so we have to stall if so. Everything else is fine
     assign hazard_detected = i_mem_read_to_execute && (rd_to_execute != 5'b0) && (rs1 == rd_to_execute || rs2 == rd_to_execute);
 
-    // Need to stall signals when a hazard is detected, especially for branch / jumps, since those take two cycles to determine
-    // We need to check if a branch or jump is in execute stage, since that is when it is resolved and taken or not, which cant be determined in decode
-    assign control_hazard_in_decode = i_branch || i_jal || i_jalr;
-    assign control_hazard_in_execute = i_branch_to_execute || i_jal_to_execute || i_jalr_to_execute;
+    // Need to stall signals when a hazard is detected, especially for jumps, since those take two cycles to determine
+    // We need to check if a jump is in execute stage, since that is when it is resolved and taken or not, which cant be determined in decode
+
+    // For project 5, removed i_branch because we are assuming branches are predicted to not be taken, so there is no hazard
+    assign control_hazard_in_decode =  i_jal || i_jalr;
+    assign control_hazard_in_execute = i_jal_to_execute || i_jalr_to_execute;
 
     // We need to pause fetch -> decode and decode -> execute
     // stall_pc has to be !control_hazard_in_execute or we get a one off cycle, since control_hazard_in_decode is asserted 1 cycle too late (asserted alongside hazard_in_execute, so make conditional for both)
@@ -453,7 +461,8 @@ module hart #(
 
 
     // For the fetch instructions, we just hold the current values. But for anything beyond execute, want to avoid holding same instruction
-    wire stall_hazard_execute = hazard_detected || control_hazard_in_execute; // In case of branch / jump, we need to wait until outcome is known in execute from ALU operations
+    // For project 5, we assume that branches are predicted to not be taken. However, if our prediction is wrong (we are redirecting / taking the branch or jump), we need to stall
+    wire stall_hazard_execute = hazard_detected || redirect_in_execute;
 
 
     // Decode -> Execute pipeline registers, separated to make it easier to read
@@ -565,7 +574,6 @@ module hart #(
     end
 
         // Memory Logic
-    reg i_mem_read_to_execute;
     reg i_mem_write_to_execute;
     always @(posedge i_clk) begin
         if (i_rst) begin
@@ -624,6 +632,13 @@ module hart #(
         .o_slt      (alu_slt)
     );
     
+    // Fixes a bug where we assumed that alu_result_to_memory was always the correct value to forward, not just for ALU Operations
+    // Instructions like lui / load / jal / jalr use different values beside the ALU result, so need to select which value to forward based on instruction
+
+    wire[31:0] memory_stage_result = (select_c_to_memory == 2'b00) ? alu_result_to_memory :
+    (select_c_to_memory == 2'b01) ? data :
+    (select_c_to_memory == 2'b10) ? pc_to_memory + 4 : immediate_to_memory; 
+
     // For proejct 5, this can come from EX stage or MEM stage due to forwarding, so update logic accordingly for RS1 / RS2 for ALU Operations
     wire forward_ex_ex_rs1 = (i_reg_write_to_memory && (rd_to_memory != 5'b0) && (rs1_to_execute == rd_to_memory)); // If producer / dependent instruction is in memory stage, writing to a valid register and is the same register.
     wire forward_mem_ex_rs1 = (i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs1_to_execute == rd_to_writeback)); // Producer WAS in memory stage, is now in writeback. So same logic
@@ -633,10 +648,10 @@ module hart #(
     wire forward_mem_ex_rs2 = (i_reg_write_to_writeback && (rd_to_writeback != 5'b0) && (rs2_to_execute == rd_to_writeback));
 
     // Wire for checking if RS1 / RS2 was actually forwarded
-    wire [31:0] rs1_forwarded = forward_ex_ex_rs1 ? alu_result_to_memory : 
+    wire [31:0] rs1_forwarded = forward_ex_ex_rs1 ? memory_stage_result : 
     forward_mem_ex_rs1 ? rd_wdata : rs1_rdata_to_execute; // If not forwarded, use the value from decode stage, or grab forwarded value
 
-    wire [31:0] rs2_forwarded = forward_ex_ex_rs2 ? alu_result_to_memory :
+    wire [31:0] rs2_forwarded = forward_ex_ex_rs2 ? memory_stage_result :
     forward_mem_ex_rs2 ? rd_wdata : rs2_rdata_to_execute;
 
     assign alu_op1 = select_a_to_execute ? pc_to_execute : rs1_forwarded; 
@@ -661,7 +676,6 @@ module hart #(
 
     // Execute to Memory Registers
         // PC
-        reg [31:0] pc_to_memory;
         reg [31:0] pc_next_to_memory; // For writeback stage, o_retire_next_pc
         always @(posedge i_clk) begin
             if (i_rst) begin
@@ -679,18 +693,21 @@ module hart #(
         reg i_mem_read_to_memory;
         reg i_mem_write_to_memory;
         reg [31:0] inst_to_memory; // Contains funct3, which we need later on, might need for other things as well, so pass whole thing just in case
+        reg [31:0] store_data_to_memory;
         always @(posedge i_clk) begin
             if (i_rst) begin
                 alu_result_to_memory <= 32'b0;
                 rs1_rdata_to_memory <= 32'b0;
                 rs2_rdata_to_memory <= 32'b0;
+                store_data_to_memory <= 32'b0;
                 i_mem_read_to_memory <= 1'b0;
                 i_mem_write_to_memory <= 1'b0;
                 inst_to_memory <= 32'b0;
             end else begin
                 alu_result_to_memory <= alu_result;
                 rs1_rdata_to_memory <= rs1_rdata_to_execute;
-                rs2_rdata_to_memory <= rs2_rdata_to_execute;
+                rs2_rdata_to_memory <= rs2_rdata_to_execute; 
+                store_data_to_memory <= rs2_forwarded; // Store data is the value of rs2, but we need to forward it if it is being written to by a previous instruction
                 i_mem_read_to_memory <= i_mem_read_to_execute;
                 i_mem_write_to_memory <= i_mem_write_to_execute;
                 inst_to_memory <= inst_to_execute;
@@ -700,8 +717,6 @@ module hart #(
         // Other signals needed in write back, pass through memory stage
         reg [4:0] rs1_to_memory;
         reg [4:0] rs2_to_memory;
-        reg [1:0] select_c_to_memory;
-        reg [31:0] immediate_to_memory;
 
         always @(posedge i_clk) begin 
             if (i_rst) begin
@@ -804,7 +819,6 @@ module hart #(
     (inst_to_memory[13:12] == 2'b01) ? half_word_data[15] : // Half word, so copy the sign bit
     1'b0 : 1'b0; // Unsigned, zero extend it
 
-    reg [31:0] data;
     always @(*) begin
         data = 32'h0; // Default to avoid latches
         case(inst_to_memory[13:12])
@@ -841,22 +855,23 @@ module hart #(
         case(inst_to_memory[13:12])
             2'b00: begin // Byte
                 case(alu_result_to_memory[1:0])
-                    2'b00: write_data = rs2_rdata_to_memory; // Don't fill in upper bits, just keep it as is (failed gradescope before in proj 3)
-                    2'b01: write_data = {rs2_rdata_to_memory[23:0], 8'b0}; 
-                    2'b10: write_data = {rs2_rdata_to_memory[15:0], 16'b0}; 
-                    2'b11: write_data = {rs2_rdata_to_memory[7:0], 24'b0}; 
+                    // Should use forwarded RS2 value for project 5
+                    2'b00: write_data = store_data_to_memory; // Don't fill in upper bits, just keep it as is (failed gradescope before in proj 3)
+                    2'b01: write_data = {store_data_to_memory[23:0], 8'b0}; 
+                    2'b10: write_data = {store_data_to_memory[15:0], 16'b0}; 
+                    2'b11: write_data = {store_data_to_memory[7:0], 24'b0}; 
                     default: write_data = 32'h0; // For gradescope compiler
                 endcase
             end
             2'b01: begin // Half word
                 case(alu_result_to_memory[1:0])
-                    2'b00: write_data = rs2_rdata_to_memory;
-                    2'b10: write_data = {rs2_rdata_to_memory[15:0], 16'b0}; 
+                    2'b00: write_data = store_data_to_memory;
+                    2'b10: write_data = {store_data_to_memory[15:0], 16'b0}; 
                     default: write_data = 32'h0; 
                 endcase
             end
             2'b10: begin // Word
-                write_data = rs2_rdata_to_memory; // Just write the whole word
+                write_data = store_data_to_memory; // Just write the whole word
             end
             default: write_data = 32'h0; // Shouldn't happen
         endcase
