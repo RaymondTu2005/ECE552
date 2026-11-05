@@ -693,21 +693,18 @@ module hart #(
         reg i_mem_read_to_memory;
         reg i_mem_write_to_memory;
         reg [31:0] inst_to_memory; // Contains funct3, which we need later on, might need for other things as well, so pass whole thing just in case
-        reg [31:0] store_data_to_memory;
         always @(posedge i_clk) begin
             if (i_rst) begin
                 alu_result_to_memory <= 32'b0;
                 rs1_rdata_to_memory <= 32'b0;
                 rs2_rdata_to_memory <= 32'b0;
-                store_data_to_memory <= 32'b0;
                 i_mem_read_to_memory <= 1'b0;
                 i_mem_write_to_memory <= 1'b0;
                 inst_to_memory <= 32'b0;
             end else begin
                 alu_result_to_memory <= alu_result;
-                rs1_rdata_to_memory <= rs1_rdata_to_execute;
-                rs2_rdata_to_memory <= rs2_rdata_to_execute; 
-                store_data_to_memory <= rs2_forwarded; // Store data is the value of rs2, but we need to forward it if it is being written to by a previous instruction
+                rs1_rdata_to_memory <= rs1_forwarded; // Forwarded value now
+                rs2_rdata_to_memory <= rs2_forwarded; 
                 i_mem_read_to_memory <= i_mem_read_to_execute;
                 i_mem_write_to_memory <= i_mem_write_to_execute;
                 inst_to_memory <= inst_to_execute;
@@ -856,22 +853,22 @@ module hart #(
             2'b00: begin // Byte
                 case(alu_result_to_memory[1:0])
                     // Should use forwarded RS2 value for project 5
-                    2'b00: write_data = store_data_to_memory; // Don't fill in upper bits, just keep it as is (failed gradescope before in proj 3)
-                    2'b01: write_data = {store_data_to_memory[23:0], 8'b0}; 
-                    2'b10: write_data = {store_data_to_memory[15:0], 16'b0}; 
-                    2'b11: write_data = {store_data_to_memory[7:0], 24'b0}; 
+                    2'b00: write_data = rs2_rdata_to_memory; // Don't fill in upper bits, just keep it as is (failed gradescope before in proj 3)
+                    2'b01: write_data = {rs2_rdata_to_memory[23:0], 8'b0}; 
+                    2'b10: write_data = {rs2_rdata_to_memory[15:0], 16'b0}; 
+                    2'b11: write_data = {rs2_rdata_to_memory[7:0], 24'b0}; 
                     default: write_data = 32'h0; // For gradescope compiler
                 endcase
             end
             2'b01: begin // Half word
                 case(alu_result_to_memory[1:0])
-                    2'b00: write_data = store_data_to_memory;
-                    2'b10: write_data = {store_data_to_memory[15:0], 16'b0}; 
+                    2'b00: write_data = rs2_rdata_to_memory; 
+                    2'b10: write_data = {rs2_rdata_to_memory[15:0], 16'b0}; 
                     default: write_data = 32'h0; 
                 endcase
             end
             2'b10: begin // Word
-                write_data = store_data_to_memory; // Just write the whole word
+                write_data = rs2_rdata_to_memory; // Just write the whole word
             end
             default: write_data = 32'h0; // Shouldn't happen
         endcase
