@@ -203,13 +203,17 @@ module hart #(
 
 
 
+
     // Fetch stage
     // Requires the program counter and o_imem_raddr, which is the instruction memory address to read from.
 
     // For project 6, we need to add multi-cycle memory support. So we assert o_imem_ren when i_imem_ready is asserted
     // Then wait for i_imem_valid to be asserted, then that can be sent to the decode stage
 
+    
+    
     // Need some type of state machine to signal states, mealy since signal is only valid for one cycle
+    
     localparam IDLE=1'b0, REQ_SENT = 1'b1;
     reg state;
     reg next_state;
@@ -529,13 +533,14 @@ module hart #(
     // We need to pause fetch -> decode and decode -> execute
     // stall_pc has to be !control_hazard_in_execute or we get a one off cycle, since control_hazard_in_decode is asserted 1 cycle too late (asserted alongside hazard_in_execute, so make conditional for both)
     // Updated for project 6. If we are still fetching instruction and waiting because it takes multiple cycles, stall the PC
-    assign stall_pc = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute) || (state == REQ_SENT); // Keep PC in fetch the same, but release once the branch/jump has actually moved on to execute (if executed for branches)
-    assign stall_fetch_decode = hazard_detected || control_hazard_in_decode || redirect_in_execute; // Stall signals from fetch -> Decode. We don't stall when branch not taken (!redirect_in_execute)
+    // This can also come from the memory stage, if we are still waiting for a memory read / write to finish.
+    assign stall_pc = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute) || (state == REQ_SENT) || (dmem_state == DMEM_REQ_SENT); // Keep PC in fetch the same, but release once the branch/jump has actually moved on to execute (if executed for branches)
+    assign stall_fetch_decode = hazard_detected || control_hazard_in_decode || redirect_in_execute || (dmem_state == DMEM_REQ_SENT); // Stall signals from fetch -> Decode. We don't stall when branch not taken (!redirect_in_execute)
 
 
     // For the fetch instructions, we just hold the current values. But for anything beyond execute, want to avoid holding same instruction
     // For project 5, we assume that branches are predicted to not be taken. However, if our prediction is wrong (we are redirecting / taking the branch or jump), we need to stall
-    wire stall_hazard_execute = hazard_detected || redirect_in_execute;
+    wire stall_hazard_execute = hazard_detected || redirect_in_execute || (dmem_state == DMEM_REQ_SENT);
 
 
     // Decode -> Execute pipeline registers, separated to make it easier to read
@@ -754,6 +759,10 @@ module hart #(
             if (i_rst) begin
                 pc_to_memory <= 32'b0;
                 pc_next_to_memory <= 32'b0;
+            end else if (dmem_state == DMEM_REQ_SENT) begin 
+                // Stall pipeline
+                pc_to_memory <= pc_to_memory;
+                pc_next_to_memory <= pc_next_to_memory;
             end else begin
                 pc_to_memory <= pc_to_execute;
                 pc_next_to_memory <= pc_next_execute;
@@ -774,6 +783,14 @@ module hart #(
                 i_mem_read_to_memory <= 1'b0;
                 i_mem_write_to_memory <= 1'b0;
                 inst_to_memory <= 32'b0;
+            end else if (dmem_state == DMEM_REQ_SENT) begin
+                // Stall pipeline
+                alu_result_to_memory <= alu_result_to_memory;
+                rs1_rdata_to_memory <= rs1_rdata_to_memory;
+                rs2_rdata_to_memory <= rs2_rdata_to_memory;
+                i_mem_read_to_memory <= i_mem_read_to_memory;
+                i_mem_write_to_memory <= i_mem_write_to_memory;
+                inst_to_memory <= inst_to_memory;
             end else begin
                 alu_result_to_memory <= alu_result;
                 rs1_rdata_to_memory <= rs1_forwarded; // Forwarded value now
@@ -796,7 +813,16 @@ module hart #(
                 rs2_to_memory <= 4'b0000;
                 select_c_to_memory <= 2'b0;
                 immediate_to_memory <= 32'b0;
-            end else begin
+            end else if (dmem_state == DMEM_REQ_SENT) begin
+                // Stall pipeline
+                i_reg_write_to_memory <= i_reg_write_to_memory;
+                rd_to_memory <= rd_to_memory;
+                rs1_to_memory <= rs1_to_memory;
+                rs2_to_memory <= rs2_to_memory;
+                select_c_to_memory <= select_c_to_memory;
+                immediate_to_memory <= immediate_to_memory;
+            end
+            else begin
                 i_reg_write_to_memory <= i_reg_write_to_execute;
                 rd_to_memory <= rd_to_execute;
                 rs1_to_memory <= rs1_to_execute;
@@ -815,6 +841,13 @@ module hart #(
                 i_trap_to_memory <= 1'b0;
                 i_halt_to_memory <= 1'b0;
                 stall_hazard_to_memory <= 1'b1; // Treat the post-reset pipeline as holding a bubble
+            end else if (dmem_state == DMEM_REQ_SENT && !i_dmem_valid) begin
+                // Stall pipeline - this one has to be !i_dmem_valid b/c it fixes a one off bug earlier where
+                // pipeline doesn't stall, but we can be in sent state and valid can be asserted at same time, 
+                // Since it's only the next cycle where we go back to IDLE
+                i_trap_to_memory <= 1'b0;
+                i_halt_to_memory <= 1'b0;
+                stall_hazard_to_memory <= 1'b1;
             end else begin
                 i_trap_to_memory <= i_trap_to_execute;
                 i_halt_to_memory <= i_halt_to_execute;
@@ -824,6 +857,38 @@ module hart #(
 
 
     // Memory
+
+    // Same mealy sm as fetch from earlier, but for memmory stage, since data memory can take multiple cycles to read / write.alu_eq
+    // The two new signals were:
+    // i_dmem_ready - Indicates data memory is ready to accept a new read or write request
+    // i_dmem_valid - Indicates that a valid data word is being returned from memory
+
+    localparam DMEM_IDLE = 1'b0, DMEM_REQ_SENT = 1'b1;
+    reg dmem_state;
+    reg dmem_next_state;
+
+    always @(posedge i_clk) begin 
+        if (i_rst) begin 
+            dmem_state <= DMEM_IDLE;
+        end else begin 
+            dmem_state <= dmem_next_state;
+        end
+    end
+
+    // Logic for mealy, identical to before
+    always @(*) begin 
+        case(dmem_state)
+            // For IDLE state, can either be triggered by a read or write, have to be careful to not assert both
+            DMEM_IDLE: dmem_next_state = (i_dmem_ready && (o_dmem_ren || o_dmem_wen)) ? DMEM_REQ_SENT : DMEM_IDLE; 
+            DMEM_REQ_SENT: dmem_next_state = i_dmem_valid ? DMEM_IDLE : DMEM_REQ_SENT;
+            default: dmem_next_state = DMEM_IDLE; // Needed for the grading compiler
+        endcase
+    end
+
+    // Afterwards, if we are in the dmem_req_sent stage, then need to stall
+    // all the stage before memory, and include that in a hazard to prevent bad values from being retired
+
+
     // Mask generation for read / write (Store / load), also memory access logic like sign vs zero extend for load/stores, and o_dmem signals
     
     // Masking logic to word align o_dmem_addr
@@ -950,8 +1015,11 @@ module hart #(
     // Data memory signals
     assign o_dmem_addr = {alu_result_to_memory[31:2], 2'b00};
     assign o_dmem_wdata = write_data;
-    assign o_dmem_ren = i_mem_read_to_memory;
-    assign o_dmem_wen = i_mem_write_to_memory;
+    // Again, like fetch stage, these are gated on if ARE in idle and want to actually send a request, otherwise don't
+    // NOTE: I realized that we check i_dmem_ready in mealy logic as well as here (same in fetch), which is a bit redundant but it works so leaving it.alu_eq
+    // Wonder if this could result in a cycle off by one error or something like a TOCTOU race condition
+    assign o_dmem_ren = (dmem_state == DMEM_IDLE && i_dmem_ready && i_mem_read_to_memory) ? 1'b1 : 1'b0;
+    assign o_dmem_wen = (dmem_state == DMEM_IDLE && i_dmem_ready && i_mem_write_to_memory) ? 1'b1 : 1'b0;
     assign o_dmem_mask = memory_mask;
 
 
