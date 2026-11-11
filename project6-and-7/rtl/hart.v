@@ -238,7 +238,6 @@ module hart #(
     wire [31:0] pc_next;
 
         // Program counter register
-
     reg [31:0] pc;
     always @(posedge i_clk) begin
         if (i_rst) begin
@@ -258,9 +257,10 @@ module hart #(
     
     // Pipeline register, fetch -> decode
     // We want to basically store the current value at the PC wire, so that it can be used again in the next cycle 
-    // To contain the new instruction (assuming no nops / stalls)
-    // But then we update register at each time, so pc wire before clock is preserved but after clock is ready to be updated
-    // Also need to store 
+    // To contain the new instruction
+
+    // Only change made for project 6: if we are waiting for memory to be valid, don't update / send new pc
+
     reg [31:0] pc_to_decode;
     always @(posedge i_clk) begin
         if (i_rst) begin
@@ -268,6 +268,9 @@ module hart #(
         end else if (redirect_in_execute) begin
             // We are actualy redirecting, so next pc to decode doens't matter / is discarded
             pc_to_decode <= 32'b0;
+        end else if (!i_imem_valid) begin
+            // Invalid, so don't update PC and keep the same value for this cycle
+            pc_to_decode <= pc_to_decode;
         end else if (control_hazard_in_execute) begin
             // Since redirect_in_execute did not assert, mean we have a branch that didn't take it, so we don't discard the current PC.
             pc_to_decode <= pc;
@@ -292,6 +295,10 @@ module hart #(
             // Again, we redirected so doesn't matter what we currently send to decode, since that is discarded
             inst_to_decode <= 32'b0;
             decode_has_inst <= 1'b0; // On reset, it shouldn't have a valid instruction to decode, done so that we avoid the trap.
+        end else if (!i_imem_valid) begin
+            // Invalid, so don't update instruction and the flag and keep the same value for this cycle
+            inst_to_decode <= inst_to_decode;
+            decode_has_inst <= decode_has_inst;
         end else if (control_hazard_in_execute) begin
             // Didn't take the branch, so we have to keep the current instruction and send it to decode since its not discarded.
             inst_to_decode <= i_imem_rdata;
