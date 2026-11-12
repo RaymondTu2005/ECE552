@@ -189,6 +189,7 @@ module hart #(
     wire [31:0] jalr_target;
     wire stall_hazard_execute;
     wire dmem_access_complete; // For reads, since writes don't stall
+    wire dmem_stall;
     reg  [31:0] pc_to_execute;
     reg  [31:0] immediate_to_execute;
     reg         i_jal_to_execute;
@@ -202,7 +203,7 @@ module hart #(
     reg         i_reg_write_to_writeback;
     reg [31:0] alu_result_to_memory; // Load / stores addresses
     reg [1:0] dmem_state;
-    wire dmem_stall;
+    reg pc_fetch_issued;
 
     localparam IDLE=1'b0, REQ_SENT = 1'b1;
     localparam DMEM_IDLE = 2'b00, DMEM_WAIT_SEND = 2'b01, DMEM_WAIT_VALID = 2'b10;
@@ -244,10 +245,22 @@ module hart #(
     // Only asserts when the state is REQ_SENT, so we don't stall the PC and it advances on the same cycle where
     // the request of address 0 for fetch is sent (but still waiting), so create some type of signal to detect it
     // Also, we couldn't use o_imem_ren before because it depends on stall pc, so it would just be a circular dependency / lock of some sort
-    wire avoid_pc_advance = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute) || dmem_state == !DMEM_IDLE; 
-    
+    wire avoid_pc_advance = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute);
+
     // If we haven't sent a signal and we can send one AND not stalling pc for something like jal / jalr or load-use hazard, then send it.
-    assign o_imem_ren = (state == IDLE && i_imem_ready && !avoid_pc_advance);
+    assign o_imem_ren = (state == IDLE && i_imem_ready && !avoid_pc_advance && !pc_fetch_issued);
+
+    // Tracks whether we've already issued / receivedd a fetch for the current pc value,
+    // so an unrelated stall_pc hold doesn't cause us to re-issue a duplicate request
+    // since there was a bug of us issuing the request multiple times in an infinite cycle when stalling
+    always @(posedge i_clk) begin
+        if (i_rst)
+            pc_fetch_issued <= 1'b0;
+        else if (!stall_pc)
+            pc_fetch_issued <= 1'b0;
+        else if (o_imem_ren && i_imem_ready)
+            pc_fetch_issued <= 1'b1;
+    end
 
     reg imem_stale;
     always @(posedge i_clk) begin
@@ -349,7 +362,7 @@ module hart #(
             decode_consumed <= 1'b0;
         end else if (redirect_in_execute) begin
             decode_consumed <= 1'b0; // Redirected, so didn't consume it
-        end else if (!i_imem_valid) begin
+        end else if (!i_imem_valid || imem_stale) begin
             // Fetch is invalid, but we can still consume if instruction in decode moves to execute
             decode_consumed <= !stall_hazard_execute ? 1'b1 : decode_consumed; // If we are stalling, then don't consume it yet, but if we are not stalling, then we can consume it
         end else if (control_hazard_in_execute) begin
@@ -1138,8 +1151,8 @@ module hart #(
             o_dmem_addr_to_writeback <= o_dmem_addr;
             o_dmem_mask_to_writeback <= o_dmem_mask;
             o_dmem_wdata_to_writeback <= o_dmem_wdata;
-            o_dmem_ren_to_writeback <= o_dmem_ren;
-            o_dmem_wen_to_writeback <= o_dmem_wen;
+            o_dmem_ren_to_writeback <= i_mem_read_to_memory;
+            o_dmem_wen_to_writeback <= i_mem_write_to_memory;
         end
     end
 
