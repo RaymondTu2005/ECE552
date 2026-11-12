@@ -188,6 +188,7 @@ module hart #(
     wire        redirect_in_execute;
     wire [31:0] jalr_target;
     wire stall_hazard_execute;
+    wire dmem_access_complete; // For reads, since writes don't stall
     reg  [31:0] pc_to_execute;
     reg  [31:0] immediate_to_execute;
     reg         i_jal_to_execute;
@@ -200,12 +201,12 @@ module hart #(
     reg         i_reg_write_to_memory;
     reg         i_reg_write_to_writeback;
     reg [31:0] alu_result_to_memory; // Load / stores addresses
-    reg dmem_state;
-    reg dmem_req_sent;
+    reg [1:0] dmem_state;
     wire dmem_stall;
 
-    localparam DMEM_IDLE = 1'b0, DMEM_REQ_SENT = 1'b1;
     localparam IDLE=1'b0, REQ_SENT = 1'b1;
+    localparam DMEM_IDLE = 2'b00, DMEM_WAIT_SEND = 2'b01, DMEM_WAIT_VALID = 2'b10;
+
 
 
 
@@ -243,11 +244,20 @@ module hart #(
     // Only asserts when the state is REQ_SENT, so we don't stall the PC and it advances on the same cycle where
     // the request of address 0 for fetch is sent (but still waiting), so create some type of signal to detect it
     // Also, we couldn't use o_imem_ren before because it depends on stall pc, so it would just be a circular dependency / lock of some sort
-    wire avoid_pc_advance = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute) || dmem_state == DMEM_REQ_SENT; 
+    wire avoid_pc_advance = hazard_detected || (control_hazard_in_decode && !control_hazard_in_execute) || dmem_state == !DMEM_IDLE; 
     
     // If we haven't sent a signal and we can send one AND not stalling pc for something like jal / jalr or load-use hazard, then send it.
     assign o_imem_ren = (state == IDLE && i_imem_ready && !avoid_pc_advance);
 
+    reg imem_stale;
+    always @(posedge i_clk) begin
+        if (i_rst)
+            imem_stale <= 1'b0;
+        else if (redirect_in_execute && (state == REQ_SENT || o_imem_ren))
+            imem_stale <= 1'b1; // We sent a request, but haven't received it yet, so stale
+        else if (imem_stale && i_imem_valid)
+            imem_stale <= 1'b0; // We received the instruction, so not stale anymore
+    end
 
     // Fetch signals
     wire [31:0] pc_next;
@@ -283,7 +293,7 @@ module hart #(
         end else if (redirect_in_execute) begin
             // We are actualy redirecting, so next pc to decode doens't matter / is discarded
             pc_to_decode <= 32'b0;
-        end else if (!i_imem_valid) begin
+        end else if (!i_imem_valid || imem_stale) begin
             // Invalid, so don't update PC and keep the same value for this cycle
             pc_to_decode <= pc_to_decode;
         end else if (control_hazard_in_execute) begin
@@ -310,7 +320,7 @@ module hart #(
             // Again, we redirected so doesn't matter what we currently send to decode, since that is discarded
             inst_to_decode <= 32'b0;
             decode_has_inst <= 1'b0; // On reset, it shouldn't have a valid instruction to decode, done so that we avoid the trap.
-        end else if (!i_imem_valid) begin
+        end else if (!i_imem_valid || imem_stale) begin
             // Invalid, so don't update instruction and the flag and keep the same value for this cycle
             inst_to_decode <= inst_to_decode;
             decode_has_inst <= decode_has_inst;
@@ -566,13 +576,14 @@ module hart #(
     // stall_pc has to be !control_hazard_in_execute or we get a one off cycle, since control_hazard_in_decode is asserted 1 cycle too late (asserted alongside hazard_in_execute, so make conditional for both)
     // Updated for project 6. If we are still fetching instruction and waiting because it takes multiple cycles, stall the PC
     // This can also come from the memory stage, if we are still waiting for a memory read / write to finish.
-    assign stall_pc = avoid_pc_advance || (state == REQ_SENT && !i_imem_valid) || o_imem_ren ||dmem_stall; // REQ_SENT && !i_imem_valid so we release on the exact cycle where i_imem_valid is asserted
-    assign stall_fetch_decode = hazard_detected || control_hazard_in_decode || redirect_in_execute || dmem_stall; // Stall signals from fetch -> Decode. We don't stall when branch not taken (!redirect_in_execute)
+    // Need !redirect_in_execute because if we are redirecting through something like a jump, never stall the PC
+    assign stall_pc =  !redirect_in_execute && (avoid_pc_advance || (state == REQ_SENT && !(i_imem_valid && !imem_stale)) || o_imem_ren || (dmem_stall && !dmem_access_complete)); // REQ_SENT && !i_imem_valid so we release on the exact cycle where i_imem_valid is asserted
+    assign stall_fetch_decode = hazard_detected || control_hazard_in_decode || redirect_in_execute || (dmem_stall && !dmem_access_complete); // Stall signals from fetch -> Decode. We don't stall when branch not taken (!redirect_in_execute)
 
 
     // For the fetch instructions, we just hold the current values. But for anything beyond execute, want to avoid holding same instruction
     // For project 5, we assume that branches are predicted to not be taken. However, if our prediction is wrong (we are redirecting / taking the branch or jump), we need to stall
-    assign stall_hazard_execute = hazard_detected || redirect_in_execute || dmem_stall || decode_consumed;
+    assign stall_hazard_execute = hazard_detected || redirect_in_execute || (dmem_stall && !dmem_access_complete) || decode_consumed;
 
 
     // Decode -> Execute pipeline registers, separated to make it easier to read
@@ -791,7 +802,7 @@ module hart #(
             if (i_rst) begin
                 pc_to_memory <= 32'b0;
                 pc_next_to_memory <= 32'b0;
-            end else if (dmem_stall) begin 
+            end else if (dmem_stall && !dmem_access_complete) begin 
                 // Stall pipeline
                 pc_to_memory <= pc_to_memory;
                 pc_next_to_memory <= pc_next_to_memory;
@@ -815,7 +826,7 @@ module hart #(
                 i_mem_read_to_memory <= 1'b0;
                 i_mem_write_to_memory <= 1'b0;
                 inst_to_memory <= 32'b0;
-            end else if (dmem_stall) begin
+            end else if (dmem_stall && !dmem_access_complete) begin
                 // Stall pipeline
                 alu_result_to_memory <= alu_result_to_memory;
                 rs1_rdata_to_memory <= rs1_rdata_to_memory;
@@ -845,7 +856,7 @@ module hart #(
                 rs2_to_memory <= 4'b0000;
                 select_c_to_memory <= 2'b0;
                 immediate_to_memory <= 32'b0;
-            end else if (dmem_stall) begin
+            end else if (dmem_stall && !dmem_access_complete) begin
                 // Stall pipeline
                 i_reg_write_to_memory <= i_reg_write_to_memory;
                 rd_to_memory <= rd_to_memory;
@@ -873,13 +884,10 @@ module hart #(
                 i_trap_to_memory <= 1'b0;
                 i_halt_to_memory <= 1'b0;
                 stall_hazard_to_memory <= 1'b1; // Treat the post-reset pipeline as holding a bubble
-            end else if (dmem_stall && !i_dmem_valid) begin
-                // Stall pipeline - this one has to be !i_dmem_valid b/c it fixes a one off bug earlier where
-                // pipeline doesn't stall, but we can be in sent state and valid can be asserted at same time, 
-                // Since it's only the next cycle where we go back to IDLE
-                i_trap_to_memory <= 1'b0;
-                i_halt_to_memory <= 1'b0;
-                stall_hazard_to_memory <= 1'b1;
+            end else if (dmem_stall && !dmem_access_complete) begin
+                i_trap_to_memory <= i_trap_to_memory;
+                i_halt_to_memory <= i_halt_to_memory;
+                stall_hazard_to_memory <= stall_hazard_to_memory;
             end else begin
                 i_trap_to_memory <= i_trap_to_execute;
                 i_halt_to_memory <= i_halt_to_execute;
@@ -895,7 +903,7 @@ module hart #(
     // i_dmem_ready - Indicates data memory is ready to accept a new read or write request
     // i_dmem_valid - Indicates that a valid data word is being returned from memory
 
-    reg dmem_next_state;
+    reg [1:0] dmem_next_state;
 
     always @(posedge i_clk) begin 
         if (i_rst) begin 
@@ -908,16 +916,19 @@ module hart #(
     // Logic for mealy, identical to before
     always @(*) begin 
         case(dmem_state)
-            // For IDLE state, can either be triggered by a read or write, have to be careful to not assert both
-            DMEM_IDLE: dmem_next_state = (i_dmem_ready && (o_dmem_ren || o_dmem_wen)) ? DMEM_REQ_SENT : DMEM_IDLE; 
-            DMEM_REQ_SENT: dmem_next_state = i_dmem_valid ? DMEM_IDLE : DMEM_REQ_SENT;
+            // If we want to write, leave IDLE state and go to WAIT_SEND
+            DMEM_IDLE: dmem_next_state = (i_mem_read_to_memory || i_mem_write_to_memory) ? DMEM_WAIT_SEND : DMEM_IDLE; 
+            DMEM_WAIT_SEND: dmem_next_state = !i_dmem_ready ? DMEM_WAIT_SEND : i_mem_write_to_memory ? DMEM_IDLE : DMEM_WAIT_VALID; // Wait to send a memory read / write. If send a write, go to IDLE, and if a read, go to WAIT_VALID
+            // This is only for reads, since writes don't send a valid signal back
+            DMEM_WAIT_VALID: dmem_next_state = i_dmem_valid ? DMEM_IDLE : DMEM_WAIT_VALID;
             default: dmem_next_state = DMEM_IDLE; // Needed for the grading compiler
         endcase
     end
 
     // Afterwards, if we are in the dmem_req_sent stage, then need to stall
     // all the stage before memory, and include that in a hazard to prevent bad values from being retired
-    assign dmem_stall = (dmem_state == DMEM_REQ_SENT) || o_dmem_ren || o_dmem_wen;
+    assign dmem_stall = (dmem_state != DMEM_IDLE) || (dmem_next_state != DMEM_IDLE);
+    assign dmem_access_complete = i_dmem_valid || o_dmem_wen; // If valid or writing, then done
 
     // Mask generation for read / write (Store / load), also memory access logic like sign vs zero extend for load/stores, and o_dmem signals
     
@@ -1048,8 +1059,8 @@ module hart #(
     // Again, like fetch stage, these are gated on if ARE in idle and want to actually send a request, otherwise don't
     // NOTE: I realized that we check i_dmem_ready in mealy logic as well as here (same in fetch), which is a bit redundant but it works so leaving it.alu_eq
     // Wonder if this could result in a cycle off by one error or something like a TOCTOU race condition
-    assign o_dmem_ren = (dmem_state == DMEM_IDLE && i_dmem_ready && i_mem_read_to_memory) ? 1'b1 : 1'b0;
-    assign o_dmem_wen = (dmem_state == DMEM_IDLE && i_dmem_ready && i_mem_write_to_memory) ? 1'b1 : 1'b0;
+    assign o_dmem_ren = (dmem_state == DMEM_WAIT_SEND && i_dmem_ready && i_mem_read_to_memory);
+    assign o_dmem_wen = (dmem_state == DMEM_WAIT_SEND && i_dmem_ready && i_mem_write_to_memory);
     assign o_dmem_mask = memory_mask;
 
 
@@ -1062,6 +1073,9 @@ module hart #(
         if (i_rst) begin
             pc_to_writeback <= 32'b0;
             pc_next_to_writeback <= 32'b0;
+        end else if (dmem_stall && !dmem_access_complete) begin
+            pc_to_writeback <= pc_to_writeback;
+            pc_next_to_writeback <= pc_next_to_writeback;
         end else begin
             pc_to_writeback <= pc_to_memory;
             pc_next_to_writeback <= pc_next_to_memory;
@@ -1081,6 +1095,12 @@ module hart #(
             select_c_to_writeback <= 2'b0;
             data_to_writeback <= 32'b0;
             immediate_to_writeback <= 32'b0;
+        end else if (dmem_stall && !dmem_access_complete) begin
+            i_reg_write_to_writeback <= i_reg_write_to_writeback;
+            alu_result_to_writeback <= alu_result_to_writeback;
+            select_c_to_writeback <= select_c_to_writeback;
+            data_to_writeback <= data_to_writeback;
+            immediate_to_writeback <= immediate_to_writeback;
         end else begin
             i_reg_write_to_writeback <= i_reg_write_to_memory;
             alu_result_to_writeback <= alu_result_to_memory;
@@ -1106,6 +1126,13 @@ module hart #(
             o_dmem_wdata_to_writeback <= 32'b0;
             o_dmem_ren_to_writeback <= 1'b0;
             o_dmem_wen_to_writeback <= 1'b0;
+        end else if (dmem_stall && !dmem_access_complete) begin
+            o_dmem_rdata_to_writeback <= o_dmem_rdata_to_writeback;
+            o_dmem_addr_to_writeback <= o_dmem_addr_to_writeback;
+            o_dmem_mask_to_writeback <= o_dmem_mask_to_writeback;
+            o_dmem_wdata_to_writeback <= o_dmem_wdata_to_writeback;
+            o_dmem_ren_to_writeback <= o_dmem_ren_to_writeback;
+            o_dmem_wen_to_writeback <= o_dmem_wen_to_writeback;
         end else begin
             o_dmem_rdata_to_writeback <= i_dmem_rdata;
             o_dmem_addr_to_writeback <= o_dmem_addr;
@@ -1137,6 +1164,16 @@ module hart #(
             rs1_rdata_to_writeback <= 32'b0;
             rs2_rdata_to_writeback <= 32'b0;
             stall_hazard_to_writeback <= 1'b1; // Treat the post-reset pipeline as holding a bubble
+        end else if (dmem_stall && !dmem_access_complete) begin
+            i_trap_to_writeback <= 1'b0;
+            i_halt_to_writeback <= 1'b0;
+            rs1_to_writeback <= rs1_to_writeback;
+            rs2_to_writeback <= rs2_to_writeback;
+            inst_to_writeback <= inst_to_writeback;
+            rd_to_writeback <= rd_to_writeback;
+            rs1_rdata_to_writeback <= rs1_rdata_to_writeback;
+            rs2_rdata_to_writeback <= rs2_rdata_to_writeback;
+            stall_hazard_to_writeback <= 1'b1;
         end else begin
             i_trap_to_writeback <= i_trap_to_memory;
             i_halt_to_writeback <= i_halt_to_memory;
