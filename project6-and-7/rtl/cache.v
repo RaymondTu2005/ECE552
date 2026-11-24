@@ -95,7 +95,293 @@ module cache (
     reg [1:0] valid [DEPTH - 1:0];
     reg       lru   [DEPTH - 1:0];
 
-    // Fill in your implementation here.
+    // =========================== definitions/logic ===============================
+    reg [2:0] current_state;
+    
+    // FSM states from schem: 
+    // IDLE -> FSM_IDLE,
+    // ALLOCATE -> (split) FSM_FILL_REQ + FSM_FILL_WAIT
+    // MEM_WRITE -> FSM_WRITE_MEM + FSM_BG_WRITE
+    // COMPARE_TAG -> obsolved within idle, discarded state defnition
+    localparam FSM_IDLE       = 3'd0;
+    localparam FSM_FILL_REQ   = 3'd1;
+    localparam FSM_FILL_WAIT  = 3'd2;
+    localparam FSM_WRITE_MEM  = 3'd3;
+    localparam FSM_BG_WRITE   = 3'd4;
+
+    // latch miss + WT req state
+    reg [31:0] req_addr_q;
+    reg [31:0] req_wdata_q;
+    reg [3:0]  req_mask_q;
+    reg        req_wen_q;
+    reg        victim_way_q;
+    
+    reg [1:0] req_cnt;
+    reg [1:0] resp_cnt;
+    reg [31:0] fill_buffer [0:3];
+    reg [31:0] wt_addr_q;
+    reg [31:0] wt_data_q;
+
+    // address decomposition
+    wire [T - 1:0] req_tag   = i_req_addr[31 : O + S];
+    wire [S - 1:0] req_index = i_req_addr[O + S - 1 : O];
+    wire [1:0]     req_word  = i_req_addr[O - 1 : 2];
+
+    wire [T - 1:0] lat_tag   = req_addr_q[31 : O + S];
+    wire [S - 1:0] lat_index = req_addr_q[O + S - 1 : O];
+    wire [1:0]     lat_word  = req_addr_q[O - 1 : 2];
+    wire [31:0]    lat_line_base = {req_addr_q[31:O], {O{1'b0}}};
+
+    // hit detection
+    wire hit0 = valid[req_index][0] && (tags0[req_index] == req_tag);
+    wire hit1 = valid[req_index][1] && (tags1[req_index] == req_tag);
+    wire hit  = hit0 || hit1;
+    wire hit_way = hit1;
+    wire any_req = i_req_ren || i_req_wen;
+
+    // byte mask expansion
+    wire [31:0] req_bitmask = {
+        {8{i_req_mask[3]}},
+        {8{i_req_mask[2]}},
+        {8{i_req_mask[1]}},
+        {8{i_req_mask[0]}}
+    };
+    
+    wire [31:0] lat_bitmask = {
+        {8{req_mask_q[3]}},
+        {8{req_mask_q[2]}},
+        {8{req_mask_q[1]}},
+        {8{req_mask_q[0]}}
+    };
+
+    // read/write hit word selection and merging
+    wire [31:0] hit_cur_word = hit1 ? datas1[req_index][req_word] : datas0[req_index][req_word];
+    wire [31:0] hit_merged_word = (hit_cur_word & ~req_bitmask) | (i_req_wdata & req_bitmask);
+
+    // victim way selection for write-back
+    wire sel_victim_way = !valid[req_index][0] ? 1'b0 :
+                            !valid[req_index][1] ? 1'b1 :
+                            ~lru[req_index];
+
+    // busy selection:
+    // idle-> if req & cache miss
+    // bg_write-> previous write hit draining, if new req arrives, stall
+    // all miss active states
+    assign o_busy = (current_state == FSM_IDLE)     ? (any_req && !hit) :
+                    (current_state == FSM_BG_WRITE) ? any_req :
+                    1'b1;
+    
+    // read data selection
+    wire [31:0] lat_read_word = victim_way_q ? datas1[lat_index][lat_word] : datas0[lat_index][lat_word];
+    assign o_res_rdata = ((current_state == FSM_IDLE) && i_req_ren && hit) ? hit_cur_word : lat_read_word;
+
+    // extern memory interface outputs
+    reg [31:0] mem_addr_r;
+    reg        mem_ren_r;
+    reg        mem_wen_r;
+    reg [31:0] mem_wdata_r;
+
+    // combinational logic for memory interface
+    always @(*) begin
+        mem_addr_r  = 32'b0;
+        mem_ren_r   = 1'b0;
+        mem_wen_r   = 1'b0;
+        mem_wdata_r = 32'b0;
+
+        case (current_state)
+            FSM_IDLE: begin
+                // write-through write hit
+                if (i_req_wen && hit && i_mem_ready) begin
+                    mem_addr_r  = {i_req_addr[31:2], 2'b00};
+                    mem_wen_r   = 1'b1;
+                    mem_wdata_r = hit_merged_word;
+                end
+            end
+
+            FSM_FILL_REQ: begin
+                // read request to memory
+                if (i_mem_ready) begin
+                    mem_addr_r = lat_line_base + {28'b0, req_cnt, 2'b00};
+                    mem_ren_r  = 1'b1;
+                end
+            end
+
+            FSM_WRITE_MEM, FSM_BG_WRITE: begin
+                // write-through write hit or write-back victim line
+                if (i_mem_ready) begin
+                    mem_addr_r  = wt_addr_q;
+                    mem_wen_r   = 1'b1;
+                    mem_wdata_r = wt_data_q;
+                end
+            end
+
+            default: begin
+                // default case, no memory operation
+                mem_addr_r  = 32'b0;
+                mem_ren_r   = 1'b0;
+                mem_wen_r   = 1'b0;
+                mem_wdata_r = 32'b0;
+            end
+        endcase
+    end
+    
+    // assign memory interface outputs
+    assign o_mem_addr  = mem_addr_r;
+    assign o_mem_ren   = mem_ren_r;
+    assign o_mem_wen   = mem_wen_r;
+    assign o_mem_wdata = mem_wdata_r;
+
+    // read-modify-write logic for write-allocate
+    wire [31:0] alloc_orig_word   = fill_buf[lat_word];
+    wire [31:0] alloc_merged_word = (alloc_orig_word & ~lat_bitmask) | (req_wdata_q & lat_bitmask);
+
+    // loop indices for memory arrays 
+    integer s_idx, w_idx;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            // reset all state and memory arrays
+            current_state        <= FSM_IDLE;
+            req_addr_q   <= 32'b0;
+            req_wen_q    <= 1'b0;
+            req_mask_q   <= 4'b0;
+            req_wdata_q  <= 32'b0;
+            victim_way_q <= 1'b0;
+            req_cnt      <= 2'b0;
+            resp_cnt     <= 2'b0;
+            wt_addr_q    <= 32'b0;
+            wt_data_q    <= 32'b0;
+            for (w_idx = 0; w_idx < 4; w_idx = w_idx + 1) begin
+                // reset fill buffer
+                fill_buf[w_idx] <= 32'b0;
+            end
+            for (s_idx = 0; s_idx < DEPTH; s_idx = s_idx + 1) begin
+                // reset valid bits, LRU bits, tags, and data arrays
+                valid[s_idx] <= 2'b00;
+                lru[s_idx]   <= 1'b0;
+                tags0[s_idx] <= {T{1'b0}};
+                tags1[s_idx] <= {T{1'b0}};
+                for (w_idx = 0; w_idx < D; w_idx = w_idx + 1) begin
+                    // reset data arrays
+                    datas0[s_idx][w_idx] <= 32'b0;
+                    datas1[s_idx][w_idx] <= 32'b0;
+                end
+            end
+        end else begin
+            case (current_state)
+                FSM_IDLE: begin
+                    // handle cache hit or miss
+                    if (any_req) begin
+                        // update LRU on hit, write data if write hit, or start fill on miss
+                        if (hit) begin
+                            lru[req_index] <= hit_way;
+                            if (i_req_wen) begin
+                                // write hit: update data array and possibly write-through to memory
+                                if (hit_way == 1'b0) begin
+                                    datas0[req_index][req_word] <= hit_merged_word;
+                                end else begin
+                                    datas1[req_index][req_word] <= hit_merged_word;
+                                end
+                                // write-through to memory if ready, otherwise queue for background write
+                                if (!i_mem_ready) begin
+                                    wt_addr_q <= {i_req_addr[31:2], 2'b00};
+                                    wt_data_q <= hit_merged_word;
+                                    current_state     <= FSM_BG_WRITE;
+                                end
+                            end
+                        end else begin
+                            // cache miss: latch request info and start fill process
+                            req_addr_q   <= {i_req_addr[31:2], 2'b00};
+                            req_wen_q    <= i_req_wen;
+                            req_mask_q   <= i_req_mask;
+                            req_wdata_q  <= i_req_wdata;
+                            victim_way_q <= sel_victim_way;
+                            req_cnt      <= 2'd0;
+                            resp_cnt     <= 2'd0;
+                            current_state        <= FSM_FILL_REQ;
+                        end
+                    end
+                end
+
+                FSM_FILL_REQ: begin
+                    // handle memory read requests for cache fill
+                    if (i_mem_valid) begin
+                        fill_buf[resp_cnt] <= i_mem_rdata;
+                        resp_cnt           <= resp_cnt + 2'd1;
+                    end
+                    // send memory read requests for each word in the cache line
+                    if (i_mem_ready) begin
+                        if (req_cnt == 2'd3) begin
+                            current_state <= FSM_FILL_WAIT;
+                        end else begin
+                            req_cnt <= req_cnt + 2'd1;
+                        end
+                    end
+                end
+
+                FSM_FILL_WAIT: begin
+                    // handle memory read responses for cache fill
+                    if (i_mem_valid) begin
+                        // store the received word in the fill buffer
+                        fill_buf[resp_cnt] <= i_mem_rdata;
+                        // increment response count
+                        if (resp_cnt == 2'd3) begin
+                            // all words received, update cache line and LRU
+                            valid[lat_index][victim_way_q] <= 1'b1;
+                            lru[lat_index]                 <= victim_way_q;
+                            // update tag and data arrays for the victim way
+                            if (victim_way_q == 1'b0) begin
+                                tags0[lat_index]    <= lat_tag;
+                                datas0[lat_index][0] <= (req_wen_q && (lat_word == 2'd0)) ? alloc_merged_word : fill_buf[0];
+                                datas0[lat_index][1] <= (req_wen_q && (lat_word == 2'd1)) ? alloc_merged_word : fill_buf[1];
+                                datas0[lat_index][2] <= (req_wen_q && (lat_word == 2'd2)) ? alloc_merged_word : fill_buf[2];
+                                datas0[lat_index][3] <= (req_wen_q && (lat_word == 2'd3)) ? alloc_merged_word : i_mem_rdata;
+                            end else begin
+                                // victim_way_q == 1'b1
+                                tags1[lat_index]    <= lat_tag;
+                                datas1[lat_index][0] <= (req_wen_q && (lat_word == 2'd0)) ? alloc_merged_word : fill_buf[0];
+                                datas1[lat_index][1] <= (req_wen_q && (lat_word == 2'd1)) ? alloc_merged_word : fill_buf[1];
+                                datas1[lat_index][2] <= (req_wen_q && (lat_word == 2'd2)) ? alloc_merged_word : fill_buf[2];
+                                datas1[lat_index][3] <= (req_wen_q && (lat_word == 2'd3)) ? alloc_merged_word : i_mem_rdata;
+                            end
+                            // write-through to memory if the original request was a write
+                            if (req_wen_q) begin
+                                wt_addr_q <= req_addr_q;
+                                wt_data_q <= (lat_word == 2'd3) ? ((i_mem_rdata & ~lat_bitmask) | (req_wdata_q & lat_bitmask))
+                                                                : alloc_merged_word;
+                                current_state     <= FSM_WRITE_MEM;
+                            end else begin
+                                // read request completed, return to idle state
+                                current_state <= FSM_IDLE;
+                            end
+                        end else begin
+                            // more words to receive, increment response count
+                            resp_cnt <= resp_cnt + 2'd1;
+                        end
+                    end
+                end
+
+                FSM_WRITE_MEM: begin
+                    // handle write-through to memory for write-allocate
+                    if (i_mem_ready) begin
+                        current_state <= FSM_IDLE;
+                    end
+                end
+
+                FSM_BG_WRITE: begin
+                    // handle background write to memory
+                    if (i_mem_ready) begin
+                        current_state <= FSM_IDLE;
+                    end
+                end
+
+                default: begin
+                    // error prevention, even though that would NEVER happen right?????
+                    current_state <= FSM_IDLE;
+                end
+            endcase
+        end
+    end
 endmodule
 
 `default_nettype wire
